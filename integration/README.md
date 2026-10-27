@@ -60,6 +60,7 @@ Expose only `window.electronAPI.discordMigration`, shaped by `native/bridge.d.ts
 | Method | IPC channel |
 |---|---|
 | `connect(input)` | `discord-migration:connect` |
+| `inspectGuild(guildId)` | `discord-migration:inspect-guild` |
 | `scan(selection)` | `discord-migration:scan` |
 | `collect(selection)` | `discord-migration:collect` |
 | `cancel()` / `disconnect()` | `discord-migration:cancel` / `discord-migration:disconnect` |
@@ -70,7 +71,7 @@ Send progress data to callbacks, not Electron event objects. Never expose ipcRen
 
 ## Consent and privacy
 
-Normal flow: own-credential input → source metadata → device-only selected-history scan → local author/content choices → filtered media/ZIP → upload → preview → explicit commit. Scan neither downloads attachments nor uploads messages. Collection filters before retained-media requests/serialization. Device credentials/cache are transient and cleared on cancellation/collection; no physical secure-erasure guarantee is implied.
+Normal flow: own-credential input → names-only source list → selected-guild structure → device-only selected-history scan → local author/content choices → filtered media/ZIP → upload → preview → explicit commit. Scan neither downloads attachments nor uploads messages. Collection filters before retained-media requests/serialization. Device credentials/cache are transient and cleared on cancellation, successful collection or idle expiry. Failed bounded packing retains inspected rows for a smaller retry; it adds no disk persistence or physical secure-erasure guarantee.
 
 Automation-risk acceptance is **not** server credential-transfer consent. The independent default-off linking choice expressly authorizes one-time verification, enforced by the bridge's `accepted_server_verification:true`, native JWT and expected discovered Discord ID. Only safe link metadata returns to the renderer. The default collection path never sends its source credential to Riparlare.
 

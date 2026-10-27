@@ -5,6 +5,7 @@ export interface DiscordMigrationBridge {
   connect(input: { token: string; acceptedRisk: true }): Promise<{
     guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount
   }>
+  inspectGuild?(guildId: string): ReturnType<DiscordMigrationBridge['connect']>
   scan(selection: ImportSelection): Promise<ImportInventory>
   collect(selection: ImportSelection): Promise<Uint8Array>
   cancel(): Promise<void>
@@ -13,6 +14,6 @@ export interface DiscordMigrationBridge {
     riparlare_access_token: string; expected_discord_id: string; accepted_server_verification: true
   }): Promise<{ discord_id: string; username: string; linked: true }>
   onProgress(callback: (event: {
-    phase: 'discovery' | 'messages' | 'media' | 'packing'; channel_id?: string; messages: number; media: number
+    phase: 'discovery' | 'messages' | 'media' | 'packing'; channel_id?: string; guild_id?: string; guild_name?: string; guilds_discovered?: number; waiting_ms?: number; messages: number; media: number
   }) => void): () => void
 }

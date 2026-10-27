@@ -7,13 +7,17 @@ import { apiErrorMessage } from '@/lib/apiError'
 import { queryClient } from '@/lib/queryClient'
 import { useAuthStore } from '@/stores/authStore'
 import type { DtoUser } from '@/types'
-import { canonicalSelection, destinationPath, discordMigrationApi, emptySelection, importWarningText, normalizeInventory, selectionDateError, selectionFingerprint, type DiscordSourceAccount, type ImportInventory, type ImportPreview, type ImportSelection, type SourceChannel, type SourceGuild, type UsernameAdoption } from '@/lib/discordMigration'
+import { canonicalSelection, collectorErrorMessage, destinationPath, discordMigrationApi, emptySelection, importWarningText, normalizeInventory, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type DiscordSourceAccount, type ImportInventory, type ImportPreview, type ImportSelection, type SourceChannel, type SourceGuild, type UsernameAdoption } from '@/lib/discordMigration'
 import SourceTree from './SourceTree'
 import ImportOptions from './ImportOptions'
 
-interface CollectorProgress { phase: 'discovery' | 'messages' | 'media' | 'packing'; channel_id?: string; messages: number; media: number }
+interface CollectorProgress {
+  phase: 'discovery' | 'messages' | 'media' | 'packing'; channel_id?: string; messages: number; media: number
+  guild_id?: string; guild_name?: string; guilds_discovered?: number; waiting_ms?: number
+}
 interface DesktopMigrationBridge {
   connect: (input: { token: string; acceptedRisk: true }) => Promise<{ guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount }>
+  inspectGuild?: (guildId: string) => Promise<{ guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount }>
   scan: (selection: ImportSelection) => Promise<ImportInventory>
   collect: (selection: ImportSelection) => Promise<Uint8Array>
   cancel: () => Promise<void>
@@ -31,6 +35,9 @@ const doneStatus = (status: string) => ['completed', 'done', 'committed'].includ
 const activeStatus = (status: string) => ['running', 'importing', 'queued', 'committing', 'processing'].includes(status)
 const phaseLabels = { discovery: 'Kanallar inceleniyor', messages: 'Mesajlar okunuyor', media: 'Ekler hazırlanıyor', packing: 'Aktarım hazırlanıyor' }
 const steps = ['Kaynak', 'İçerik seçimi', 'Önizleme', 'Aktarım']
+const retainSourceWarnings = (data: ImportInventory, warnings: string[] = []): ImportInventory => (
+  { ...data, warnings: [...new Set([...warnings, ...(data.warnings ?? [])])] }
+)
 
 export default function DiscordImportWizard({ onClose }: { onClose?: () => void }) {
   const { t } = useTranslation()
@@ -52,7 +59,8 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   const [linkResult, setLinkResult] = useState<{ discordId: string; status: 'verified' | 'failed' } | null>(null)
   const [adoptSourceUsername, setAdoptSourceUsername] = useState(false)
   const [usernameResult, setUsernameResult] = useState<UsernameAdoption | 'saving' | null>(null)
-  const [busy, setBusy] = useState<'upload' | 'connect' | 'scan' | 'collect' | 'preview' | 'commit' | 'resume' | null>(null)
+  const [busy, setBusy] = useState<'upload' | 'connect' | 'inspect' | 'scan' | 'collect' | 'preview' | 'commit' | 'resume' | null>(null)
+  const [loadingGuildId, setLoadingGuildId] = useState<string | null>(null)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [collectorProgress, setCollectorProgress] = useState<CollectorProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -60,12 +68,15 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   const fileInput = useRef<HTMLInputElement>(null)
   const uploadController = useRef<AbortController | null>(null)
   const requestSerial = useRef(0)
+  const selectionRevision = useRef(0)
   const mounted = useRef(true)
   const currentFingerprint = useMemo(() => inventory && selection ? selectionFingerprint(selection, inventory) : '', [inventory, selection])
   const validPreview = Boolean(preview && previewFingerprint === currentFingerprint)
   const canonical = useMemo(() => inventory && selection ? canonicalSelection(selection, inventory) : null, [inventory, selection])
   const dateError = selection ? selectionDateError(selection) : null
+  const limitError = canonical ? selectionLimitError(canonical) : null
   const selectedCount = canonical?.channel_ids.length ?? 0
+  const unloadedSelectedGuild = inventory?.guilds.some(guild => guild.channels_loaded === false && canonical?.guild_ids.includes(guild.id)) ?? false
   const working = !!busy || Boolean(inventory && activeStatus(inventory.status))
 
   useEffect(() => {
@@ -90,8 +101,8 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     const controller = new AbortController()
     const timer = window.setInterval(() => {
       discordMigrationApi.get(inventory.id, controller.signal).then(updated => {
-        if (!mounted.current) return
-        setInventory(updated)
+        if (!mounted.current || controller.signal.aborted) return
+        setInventory(current => current?.id === updated.id ? retainSourceWarnings(updated, current.warnings) : current)
         if (updated.error && !doneStatus(updated.status)) setError('Aktarım tamamlanamadı. Ayrıntıları inceleyip aynı aktarımı yeniden deneyebilirsin.')
       }).catch(() => {
         if (mounted.current && !controller.signal.aborted) setError('Aktarım durumu alınamadı. Bağlantını kontrol edip durumu yenile; yeni bir aktarım başlatmana gerek yok.')
@@ -102,8 +113,9 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
 
   useEffect(() => { setConfirmed(false) }, [currentFingerprint])
 
-  function changeSelection(value: ImportSelection) {
-    setSelection(value)
+  function changeSelection(value: ImportSelection | ((previous: ImportSelection) => ImportSelection)) {
+    selectionRevision.current++
+    setSelection(previous => previous ? typeof value === 'function' ? value(previous) : value : previous)
     setError(null)
     setConfirmed(false)
     setAdoptSourceUsername(false)
@@ -117,6 +129,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     setPreviewFingerprint('')
     setDesktopSource(false)
     setDesktopScanned(false)
+    setLoadingGuildId(null)
     setConfirmed(false)
     setAdoptSourceUsername(false)
     setUsernameResult(null)
@@ -130,7 +143,10 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     uploadController.current = controller
     setBusy('upload'); setError(null); setUploadProgress(0)
     try {
-      const data = await discordMigrationApi.upload(file, controller.signal, percent => { if (serial === requestSerial.current) setUploadProgress(percent) })
+      const uploaded = await discordMigrationApi.upload(file, controller.signal, percent => { if (serial === requestSerial.current) setUploadProgress(percent) })
+      // Local scan failures can be absent from normalized server inventory. Keep
+      // those explicit caveats when replacing local inventory with its ZIP job.
+      const data = retainSourceWarnings(uploaded, previewAfterUpload ? inventory?.warnings : [])
       if (mounted.current && serial === requestSerial.current) {
         useInventory(data, previous)
         // An idempotent upload can return the existing committed/running job.
@@ -179,12 +195,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
           } catch { if (mounted.current && serial === requestSerial.current) setLinkResult({ discordId: data.account.id, status: 'failed' }) }
         } else setLinkResult({ discordId: data.account.id, status: 'failed' })
       }
-    } catch {
-      if (mounted.current && serial === requestSerial.current) setError('Discord bağlantısı kurulamadı. Erişimini ve kimlik bilgisini kontrol et. Kimlik bilgisini hata raporuna ekleme.')
+    } catch (failure) {
+      if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Discord bağlantısı kurulamadı. Erişimini ve kimlik bilgisini kontrol et. Kimlik bilgisini hata raporuna ekleme.'))
     } finally { if (mounted.current && serial === requestSerial.current) setBusy(null) }
   }
   async function collect() {
-    if (!bridge || !canonical) return
+    if (!bridge || !canonical || unloadedSelectedGuild || limitError) return
     const serial = ++requestSerial.current
     setBusy('collect'); setError(null); setCollectorProgress(null)
     try {
@@ -194,12 +210,108 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       const buffer = new ArrayBuffer(data.byteLength)
       new Uint8Array(buffer).set(data)
       await upload(new File([buffer], 'discord-aktarim.zip', { type: 'application/zip' }), canonical, true)
-    } catch {
-      if (mounted.current && serial === requestSerial.current) setError('Seçili içerik hazırlanamadı. Bazı kanallara erişim değişmiş veya kaynak bağlantısı kesilmiş olabilir. Kaynağa dönüp yeniden bağlanabilirsin.')
+    } catch (failure) {
+      if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Seçili içerik hazırlanamadı; seçimlerin korundu. Daha az kanal veya ek seçip yeniden deneyebilirsin. Kaynak bağlantısı kesildiyse kaynağı değiştirip yeniden bağlan.'))
     } finally { if (mounted.current && serial === requestSerial.current) setBusy(null) }
   }
+  async function inspectGuild(guildId: string, selectAll: boolean) {
+    if (!inventory || !selection || busy) return
+    const guild = inventory.guilds.find(item => item.id === guildId)
+    if (!guild || guild.channels_loaded !== false) return
+    if (!bridge?.inspectGuild) { setError('Sunucu kanallarını yüklemek için masaüstü uygulamasını güncelle.'); return }
+    const serial = ++requestSerial.current
+    const sourceId = inventory.id
+    if (selectAll) changeSelection(previous => ({ ...previous, guild_ids: [...new Set([...previous.guild_ids, guildId])] }))
+    setLoadingGuildId(guildId); setBusy('inspect'); setError(null); setCollectorProgress(null)
+    try {
+      const raw = await bridge.inspectGuild(guildId)
+      if (!mounted.current || serial !== requestSerial.current) return
+      const updated = normalizeInventory({ ...inventory, ...raw, id: sourceId, status: inventory.status, source_hash: inventory.source_hash })
+      const loaded = updated.guilds.find(item => item.id === guildId)
+      if (!loaded || loaded.channels_loaded !== true) throw new Error('Guild inspection incomplete')
+      setInventory(current => current && current.id === sourceId
+        ? normalizeInventory({ ...current, ...raw, id: current.id, status: current.status, source_hash: current.source_hash, authors: current.authors }) : current)
+      setSelection(previous => {
+        if (!previous) return previous
+        const next = { ...previous, role_ids: { ...previous.role_ids,
+          [guildId]: loaded.roles.filter(role => !role.managed).map(role => role.id) } }
+        // A user may clear the pending guild while its channels load. Never
+        // resurrect that selection or overwrite unrelated DM/channel changes.
+        return selectAll && previous.guild_ids.includes(guildId)
+          ? toggleChannels(next, updated, updated.channels.filter(channel => channel.guild_id === guildId).map(channel => channel.id), true)
+          : next
+      })
+      setFocusedId(previous => previous ?? updated.channels.find(channel => channel.guild_id === guildId)?.id ?? null)
+      setDesktopScanned(false); setPreview(null); setPreviewFingerprint(''); setConfirmed(false)
+    } catch (failure) {
+      if (mounted.current && serial === requestSerial.current) {
+        setError(collectorErrorMessage(failure, `${guild.name} sunucusunun kanalları alınamadı. Yeniden deneyebilirsin; diğer seçimlerin korundu.`))
+        if (selectAll) setSelection(previous => previous ? { ...previous, guild_ids: previous.guild_ids.filter(id => id !== guildId) } : previous)
+      }
+    } finally {
+      if (mounted.current && serial === requestSerial.current) { setBusy(null); setLoadingGuildId(null) }
+    }
+  }
+  async function selectAllSources() {
+    if (!inventory || !selection || busy) return
+    const upfrontLimit = selectionLimitError({ channel_ids: inventory.channels.map(channel => channel.id), guild_ids: inventory.guilds.map(guild => guild.id) })
+    if (upfrontLimit) { setError(upfrontLimit); return }
+    const unloaded = inventory.guilds.filter(guild => guild.channels_loaded === false)
+    if (!unloaded.length) {
+      changeSelection(previous => ({ ...toggleChannels(previous, inventory, inventory.channels.map(channel => channel.id), true), guild_ids: inventory.guilds.map(guild => guild.id) }))
+      return
+    }
+    if (!bridge?.inspectGuild) { setError('Tüm sunucuların kanallarını yüklemek için masaüstü uygulamasını güncelle.'); return }
+    const serial = ++requestSerial.current
+    const startingSelectionRevision = selectionRevision.current
+    let updated = inventory
+    const failed: string[] = []
+    let firstSafeFailure = ''
+    setBusy('inspect'); setError(null); setCollectorProgress(null)
+    try {
+      for (const guild of unloaded) {
+        if (!mounted.current || serial !== requestSerial.current) return
+        setLoadingGuildId(guild.id); setCollectorProgress(null)
+        let raw: Awaited<ReturnType<NonNullable<DesktopMigrationBridge['inspectGuild']>>>
+        try { raw = await bridge.inspectGuild(guild.id) }
+        catch (failure) {
+          if (!mounted.current || serial !== requestSerial.current) return
+          failed.push(guild.name); firstSafeFailure ||= collectorErrorMessage(failure, '')
+          continue
+        }
+        if (!mounted.current || serial !== requestSerial.current) return
+        const candidate = normalizeInventory({ ...updated, ...raw, id: inventory.id, status: inventory.status, source_hash: inventory.source_hash })
+        const loaded = candidate.guilds.find(item => item.id === guild.id)
+        if (!loaded || loaded.channels_loaded !== true) { failed.push(guild.name); continue }
+        updated = candidate
+        setInventory(updated)
+        // Retain useful metadata/default roles even if a later guild hits a limit.
+        // Channel/guild selections remain unchanged until the whole request fits.
+        const defaultRoles = loaded.roles.filter(role => !role.managed).map(role => role.id)
+        setSelection(previous => previous ? { ...previous, role_ids: { ...previous.role_ids, [guild.id]: defaultRoles } } : previous)
+        const exceeded = selectionLimitError({ channel_ids: updated.channels.map(channel => channel.id), guild_ids: updated.guilds.map(item => item.id) })
+        if (exceeded) { setError(exceeded); return }
+      }
+      const loadedIds = updated.guilds.filter(guild => guild.channels_loaded !== false).map(guild => guild.id)
+      const loaded = new Set(loadedIds)
+      const channelIds = updated.channels.filter(channel => !channel.guild_id || loaded.has(channel.guild_id)).map(channel => channel.id)
+      const exceeded = selectionLimitError({ channel_ids: channelIds, guild_ids: loadedIds })
+      if (exceeded) { setError(exceeded); return }
+      if (selectionRevision.current !== startingSelectionRevision) {
+        setError('Sunucular yüklendi. Yükleme sırasında seçimlerini değiştirdiğin için tümünü otomatik seçmedim; son seçimlerin korundu.')
+        return
+      }
+      changeSelection(previous => ({ ...toggleChannels(previous, updated, channelIds, true), guild_ids: loadedIds }))
+      setDesktopScanned(false); setPreview(null); setPreviewFingerprint('')
+      if (failed.length) setError(`${failed.length} sunucunun kanalları alınamadı (${failed.slice(0, 3).join(', ')}). Yüklenebilen kaynaklar seçildi; eksik sunucuları yeniden açabilirsin.${firstSafeFailure ? ` ${firstSafeFailure}` : ''}`)
+    } catch (failure) {
+      if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Tüm kaynaklar seçilemedi. Önceki seçimlerin korundu; yüklenen sunucuları tek tek seçebilirsin.'))
+    } finally {
+      if (mounted.current && serial === requestSerial.current) { setBusy(null); setLoadingGuildId(null) }
+    }
+  }
   async function scan() {
-    if (!bridge?.scan || !canonical) return
+    if (!bridge?.scan || !canonical || unloadedSelectedGuild || limitError) return
     const serial = ++requestSerial.current
     setBusy('scan'); setError(null); setCollectorProgress(null)
     try {
@@ -210,12 +322,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       setDesktopSource(true); setDesktopScanned(true)
       setFocusedId(data.channels.find(channel => canonical.channel_ids.includes(channel.id))?.id ?? data.channels[0]?.id ?? null)
       setPreview(null); setPreviewFingerprint(''); setConfirmed(false)
-    } catch {
-      if (mounted.current && serial === requestSerial.current) setError('Seçili kanallar cihazında incelenemedi. Erişimini kontrol edip yeniden deneyebilirsin; hiçbir içerik Riparlare’ye gönderilmedi.')
+    } catch (failure) {
+      if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Seçili kanallar cihazında incelenemedi. Erişimini kontrol edip yeniden deneyebilirsin; hiçbir içerik Riparlare’ye gönderilmedi.'))
     } finally { if (mounted.current && serial === requestSerial.current) setBusy(null) }
   }
   async function makePreview() {
-    if (!inventory || !canonical || dateError || desktopSource) return
+    if (!inventory || !canonical || dateError || desktopSource || unloadedSelectedGuild || limitError) return
     const fingerprint = currentFingerprint
     setBusy('preview'); setError(null)
     try {
@@ -229,7 +341,8 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     if (!inventory || !canonical || !preview || !validPreview || !confirmed) return
     setBusy('commit'); setError(null)
     try {
-      const data = await discordMigrationApi.commit(inventory.id, canonical, preview.selection_hash)
+      const committed = await discordMigrationApi.commit(inventory.id, canonical, preview.selection_hash)
+      const data = retainSourceWarnings(committed, inventory.warnings)
       if (!mounted.current) return
       setInventory(data); setStep(3)
       setJobs(previous => [data, ...previous.filter(job => job.id !== data.id)])
@@ -264,11 +377,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     uploadController.current?.abort()
     requestSerial.current++
     await bridge?.cancel().catch(() => undefined)
-    if (mounted.current) { setBusy(null); setError('Hazırlama durduruldu. Riparlare’de yeni bir sunucu veya sohbet oluşturulmadı.'); setCollectorProgress(null) }
+    if (mounted.current) { setBusy(null); setLoadingGuildId(null); setError('Hazırlama durduruldu. Devam etmek için kaynağı değiştirip yeniden bağlan. Riparlare’de yeni bir sunucu veya sohbet oluşturulmadı.'); setCollectorProgress(null) }
   }
   async function resetSource() {
+    requestSerial.current++
     await bridge?.disconnect().catch(() => undefined)
-    setToken(''); setInventory(null); setSelection(null); setDesktopSource(false); setDesktopScanned(false); setPreview(null); setStep(0); setError(null)
+    setToken(''); setInventory(null); setSelection(null); setDesktopSource(false); setDesktopScanned(false); setLoadingGuildId(null); setPreview(null); setStep(0); setError(null)
     setLinkResult(null); setAdoptSourceUsername(false); setUsernameResult(null); setServerVerificationConsent(false)
   }
   const sourceBanner = desktopSource
@@ -276,6 +390,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       ? 'Seçili geçmiş şu anda yalnızca cihazında. Hariç tutacağın kişileri, tarihleri ve ek türlerini seç; bu içerikler ayıklanmadan Riparlare’ye gönderilmez.'
       : 'Önce kanalları seç. Seçili geçmiş yalnızca cihazında incelenecek; ardından kişileri ve tarihleri ayıklayıp Riparlare’ye göndereceksin.'
     : 'Hiçbir karşı hesap otomatik eklenmez. Aktarılan geçmiş yalnızca sana görünür; yeni mesajlar için normal kanal izinleri geçerlidir.'
+  const loadingGuildName = collectorProgress?.guild_name || inventory?.guilds.find(guild => guild.id === loadingGuildId)?.name
+  const waitingText = (collectorProgress?.waiting_ms ?? 0) > 0
+    ? ` · Discord sınırı nedeniyle ${Math.ceil((collectorProgress?.waiting_ms ?? 0) / 1000)} sn bekleniyor` : ''
+  const discoveryProgress = busy === 'inspect'
+    ? `${loadingGuildName || 'Seçili sunucu'} kanalları yükleniyor${waitingText}`
+    : `Sunucu listesi hazırlanıyor${collectorProgress?.guilds_discovered !== undefined ? ` · ${collectorProgress.guilds_discovered} sunucu bulundu` : ''}${waitingText}`
 
   return <div className="flex h-full min-h-0 flex-col bg-background text-foreground" data-testid="discord-import-wizard">
     <header className="flex shrink-0 items-start gap-3 border-b px-5 py-5 sm:px-8">
@@ -310,7 +430,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     {step === 1 && inventory && selection && <>
       <p className="shrink-0 border-b bg-muted/30 px-5 py-3 text-xs leading-relaxed text-muted-foreground sm:px-8">{sourceBanner}</p>
       {linkResult && linkResult.discordId === inventory.account?.id && <p role="status" className="shrink-0 border-b px-5 py-3 text-xs leading-relaxed sm:px-8">{linkResult.status === 'verified' ? 'Discord hesabın doğrulanmış kimliğiyle bağlandı. Kullanıcı adlarının aynı olması gerekmiyor; özel geçmiş erişimi değişmez.' : 'Discord hesabı bağlanamadı. Bu durum aktarımı engellemez; içerik seçimine devam edebilirsin.'}</p>}
-      <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(260px,35%)_1fr] md:overflow-hidden"><div className="h-80 border-b md:h-auto md:min-h-0 md:border-b-0 md:border-r"><SourceTree inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} onFocus={setFocusedId} /></div><ImportOptions inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} /></main>
+      <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(260px,35%)_1fr] md:overflow-hidden"><div className="h-80 border-b md:h-auto md:min-h-0 md:border-b-0 md:border-r"><SourceTree inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} onFocus={setFocusedId} onInspectGuild={desktopSource ? (id, selectAll) => void inspectGuild(id, selectAll) : undefined} onSelectAll={() => void selectAllSources()} loadingGuildId={loadingGuildId} inspectionDisabled={!!busy} /></div><ImportOptions inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} /></main>
     </>}
 
     {step === 2 && inventory && preview && <main className="min-h-0 flex-1 overflow-y-auto px-5 py-7 sm:px-8"><div className="mx-auto max-w-3xl"><h2 className="text-2xl font-semibold">Seçtiklerin böyle gelecek</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Bu önizleme sunucuda seçimlerine göre hesaplandı. Aktarılan geçmiş yalnızca sana görünür. Karşı hesaplar oluşturulmaz veya gruplara otomatik eklenmez.</p><dl className="mt-7 grid grid-cols-2 gap-x-6 gap-y-5 border-y py-5 sm:grid-cols-4">{([['Kanal', preview.counts.channels], ['Mesaj', preview.counts.messages], ['Ek', preview.counts.media], ['Hariç mesaj', preview.counts.excluded_messages]] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 text-2xl font-semibold tabular-nums">{value.toLocaleString('tr-TR')}</dd></div>)}</dl>
@@ -330,7 +450,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       <button type="button" disabled={!!busy} onClick={() => void resume(inventory.id)} className="mt-5 block text-sm text-muted-foreground underline underline-offset-4">Durumu yenile</button>
     </div></main>}
 
-    {busy && busy !== 'commit' && <div role="status" aria-live="polite" className="flex shrink-0 items-center gap-3 border-t bg-popover px-5 py-3 text-sm sm:px-8"><Loader2 className="h-4 w-4 shrink-0 animate-spin" /><span className="flex-1">{(busy === 'collect' || busy === 'scan') && collectorProgress ? `${phaseLabels[collectorProgress.phase]} · ${collectorProgress.messages} mesaj · ${collectorProgress.media} ek` : busy === 'scan' ? 'Geçmiş yalnızca cihazında inceleniyor…' : busy === 'upload' ? `Arşiv okunuyor · %${uploadProgress}` : busy === 'connect' ? 'Kaynaklar inceleniyor…' : busy === 'preview' ? 'Seçimlerin hesaplanıyor…' : 'Aktarım açılıyor…'}</span>{(busy === 'collect' || busy === 'scan' || busy === 'upload' || busy === 'connect') && <button type="button" onClick={() => void cancelSource()} className="underline underline-offset-4">Durdur</button>}</div>}
-    {step > 0 && step < 3 && <footer className="flex shrink-0 items-center justify-between gap-3 border-t bg-sidebar px-5 py-4 sm:px-8"><button type="button" disabled={working} onClick={() => step === 1 ? void resetSource() : setStep(1)} className="inline-flex items-center gap-2 rounded-md px-2 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-40"><ArrowLeft className="h-4 w-4" />{step === 1 ? 'Kaynak değiştir' : 'Seçime dön'}</button><div className="flex min-w-0 flex-col items-end gap-1">{dateError && <span className="text-xs text-destructive">{dateError}</span>}<button type="button" disabled={working || (step === 1 && (!canonical || (!selectedCount && !canonical.guild_ids.length) || !!dateError)) || (step === 2 && (!validPreview || !confirmed))} onClick={() => void (step === 1 ? desktopSource ? desktopScanned ? collect() : scan() : makePreview() : commit())} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{step === 1 ? desktopSource && !desktopScanned ? 'Seçili içeriği hazırla' : 'Seçimleri incele' : 'Riparlare’ye aktar'}{!busy && <ArrowRight className="h-4 w-4" />}</button></div></footer>}
+    {busy && busy !== 'commit' && <div role="status" aria-live="polite" className="flex shrink-0 items-center gap-3 border-t bg-popover px-5 py-3 text-sm sm:px-8"><Loader2 className="h-4 w-4 shrink-0 animate-spin" /><span className="flex-1">{busy === 'inspect' || busy === 'connect' ? discoveryProgress : (busy === 'collect' || busy === 'scan') && collectorProgress ? `${phaseLabels[collectorProgress.phase]} · ${collectorProgress.messages} mesaj · ${collectorProgress.media} ek${waitingText}` : busy === 'scan' ? 'Geçmiş yalnızca cihazında inceleniyor…' : busy === 'upload' ? `Arşiv okunuyor · %${uploadProgress}` : busy === 'preview' ? 'Seçimlerin hesaplanıyor…' : 'Aktarım açılıyor…'}</span>{(busy === 'collect' || busy === 'scan' || busy === 'upload' || busy === 'connect' || busy === 'inspect') && <button type="button" onClick={() => void cancelSource()} className="underline underline-offset-4">Durdur</button>}</div>}
+    {step > 0 && step < 3 && <footer className="flex shrink-0 items-center justify-between gap-3 border-t bg-sidebar px-5 py-4 sm:px-8"><button type="button" disabled={working} onClick={() => step === 1 ? void resetSource() : setStep(1)} className="inline-flex items-center gap-2 rounded-md px-2 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-40"><ArrowLeft className="h-4 w-4" />{step === 1 ? 'Kaynak değiştir' : 'Seçime dön'}</button><div className="flex min-w-0 flex-col items-end gap-1">{dateError || limitError ? <span className="max-w-sm text-right text-xs text-destructive">{dateError || limitError}</span> : unloadedSelectedGuild && <span className="text-xs text-muted-foreground">Seçili sunucunun kanalları yüklenmeli.</span>}<button type="button" disabled={working || unloadedSelectedGuild || !!limitError || (step === 1 && (!canonical || (!selectedCount && !canonical.guild_ids.length) || !!dateError)) || (step === 2 && (!validPreview || !confirmed))} onClick={() => void (step === 1 ? desktopSource ? desktopScanned ? collect() : scan() : makePreview() : commit())} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{step === 1 ? desktopSource && !desktopScanned ? 'Seçili içeriği hazırla' : 'Seçimleri incele' : 'Riparlare’ye aktar'}{!busy && <ArrowRight className="h-4 w-4" />}</button></div></footer>}
   </div>
 }

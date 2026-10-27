@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('@/api/client', () => ({ axiosInstance: {} }))
 vi.mock('@/lib/connectionConfig', () => ({ getApiBaseUrl: () => 'https://riparlare.test/api/v1' }))
 
-import { canonicalSelection, channelSubtree, emptySelection, normalizeInventory, ownedImportMediaUrl, selectionDateError, selectionFingerprint, toggleChannels, type ImportInventory } from './discordMigration'
+import { canonicalSelection, channelSubtree, collectorErrorMessage, emptySelection, normalizeInventory, ownedImportMediaUrl, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type ImportInventory } from './discordMigration'
 
 const inventory: ImportInventory = {
   id: 'job', status: 'ready', source_hash: 'hash', warnings: [],
@@ -83,5 +83,21 @@ describe('Discord import selection boundaries', () => {
     const request = canonicalSelection(selection, inventory)
     expect(request.channel_ids).toEqual(['302'])
     expect(request.include_voice_text).toBe(false)
+  })
+
+  it('maps only safe collector codes inside IPC wrappers without displaying raw errors', () => {
+    expect(collectorErrorMessage(new Error("Error invoking remote method 'scan': Error: SOURCE_CHANNEL_LIMIT"), 'fallback')).toContain('3000 kanal')
+    expect(collectorErrorMessage(new Error('SOURCE_TIMEOUT'), 'fallback')).toContain('zaman aşımına')
+    for (const message of ['private-token=secret-value', 'SOURCE_NOT_ALLOWED private-secret', 'SOURCE_CHANNEL_LIMITsuffix']) {
+      expect(collectorErrorMessage(new Error(message), 'Güvenli açıklama')).toBe('Güvenli açıklama')
+    }
+  })
+
+  it('allows limit boundaries but rejects oversized channel and guild selections before collection', () => {
+    const channels = Array.from({ length: 3000 }, (_, index) => String(index + 1))
+    expect(selectionLimitError({ channel_ids: channels, guild_ids: [] })).toBeNull()
+    expect(selectionLimitError({ channel_ids: [...channels, '3001'], guild_ids: [] })).toContain('3000 kanal')
+    expect(selectionLimitError({ channel_ids: [], guild_ids: Array.from({ length: 2001 }, (_, index) => String(index + 1)) })).toContain('2000 sunucu')
+    expect(selectionLimitError({ channel_ids: Array.from({ length: 3001 }, () => 'same-source-id'), guild_ids: [] })).toBeNull()
   })
 })

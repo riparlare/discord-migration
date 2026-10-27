@@ -1,6 +1,26 @@
 import { app, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
-import { DiscordCollector, type CollectorSelection } from '../../collector.mjs';
+import { DiscordCollector, SourceError, type CollectorSelection } from '../../collector.mjs';
 import https from 'node:https';
+
+// Only fixed codes cross IPC; source bodies, credentials and arbitrary errors do not.
+function sourceFailure(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : '';
+  const codes: Record<string, string> = {
+    'Message count limit reached; choose fewer channels': 'SOURCE_MESSAGE_LIMIT',
+    'Local inspection limit reached; choose fewer channels': 'SOURCE_INSPECTION_LIMIT',
+    'Archive size limit reached; choose fewer channels': 'SOURCE_ARCHIVE_LIMIT',
+    'Archive entry limit reached; choose fewer channels': 'SOURCE_ENTRY_LIMIT',
+    'Rescan required to include messages': 'SOURCE_RESCAN_REQUIRED',
+    'Source not inspected; choose the source again': 'SOURCE_RESCAN_REQUIRED',
+    SOURCE_RESCAN_REQUIRED: 'SOURCE_RESCAN_REQUIRED', SOURCE_TIMEOUT: 'SOURCE_TIMEOUT',
+  };
+  return new Error(codes[message] ?? fallback);
+}
+function validateSelection(selection: CollectorSelection) {
+  if (!selection || !Array.isArray(selection.channel_ids) || !Array.isArray(selection.guild_ids)) throw new Error('Geçersiz seçim.');
+  if (selection.channel_ids.length > 3000) throw new Error('SOURCE_CHANNEL_LIMIT');
+  if (selection.guild_ids.length > 2000) throw new Error('SOURCE_GUILD_LIMIT');
+}
 
 function verifyAccount(token: string, riparlareToken: string, expectedId: string) {
   return new Promise<unknown>((resolve, reject) => {
@@ -63,38 +83,61 @@ export function registerDiscordMigration(getWindow: () => BrowserWindow | null) 
     input.token = undefined;
     collector = current;
     // Bound idle credentials. An active collection owns its own request timeouts.
-    timer = setTimeout(disconnect, 10 * 60 * 1000);
     try {
       const inventory = await current.discover();
       if (generation !== activeGeneration) throw new Error('Collection cancelled');
+      timer = setTimeout(disconnect, 10 * 60 * 1000);
       return inventory;
-    } catch {
+    } catch (error) {
       if (generation === activeGeneration) disconnect();
-      throw new Error('Discord listesi alınamadı. Oturumunu ve erişim izinlerini kontrol et.');
+      throw sourceFailure(error, 'Discord listesi alınamadı. Oturumunu ve erişim izinlerini kontrol et.');
+    }
+  });
+  ipcMain.handle('discord-migration:inspect-guild', async (event, guildId: unknown) => {
+    trusted(event);
+    if (!collector || collecting) throw new Error('Önce Discord hesabını bağla.');
+    if (typeof guildId !== 'string' || !/^[1-9]\d{0,19}$/.test(guildId)) throw new Error('Geçersiz sunucu seçimi.');
+    const current = collector, activeGeneration = generation;
+    collecting = true;
+    if (timer) clearTimeout(timer);
+    try {
+      const result = await current.inspectGuild(guildId);
+      if (generation !== activeGeneration) throw new Error('Collection cancelled');
+      return result;
+    } catch (error) {
+      if (error instanceof SourceError && error.status === 401 && generation === activeGeneration) disconnect();
+      throw sourceFailure(error, 'Sunucunun kanal listesi alınamadı. Erişimini kontrol edip tekrar dene.');
+    } finally {
+      if (generation === activeGeneration) { collecting = false; timer = setTimeout(disconnect, 10 * 60 * 1000); }
     }
   });
   ipcMain.handle('discord-migration:collect', async (event, selection: CollectorSelection) => {
     trusted(event);
     if (!collector || collecting) throw new Error('Önce Discord hesabını bağla.');
-    if (!selection || !Array.isArray(selection.channel_ids) || selection.channel_ids.length > 3000 || !Array.isArray(selection.guild_ids) || selection.guild_ids.length > 2000) {
-      throw new Error('Geçersiz veya çok büyük seçim.');
-    }
+    validateSelection(selection);
     const activeGeneration = generation, current = collector;
     collecting = true;
     if (timer) clearTimeout(timer);
+    let completed = false;
     try {
       const bytes = await current.collect(selection);
       if (generation !== activeGeneration) throw new Error('Collection cancelled');
+      completed = true;
       return bytes;
     } catch (error) {
-      if (error instanceof Error && error.message === 'Rescan required to include messages') throw new Error('Mesajları da eklemek için Kaynak değiştir düğmesiyle kaynakları yeniden incele.');
-      throw new Error('İçerik alınamadı. Daha az kanal seçerek tekrar dene; erişilemeyen içerikler atlanır.');
-    } finally { if (generation === activeGeneration) disconnect(); }
+      if (error instanceof SourceError && error.status === 401 && generation === activeGeneration) disconnect();
+      throw sourceFailure(error, 'İçerik alınamadı. Daha az kanal seçerek tekrar dene; erişilemeyen içerikler atlanır.');
+    } finally {
+      if (generation === activeGeneration) {
+        if (completed) disconnect();
+        else { collecting = false; timer = setTimeout(disconnect, 10 * 60 * 1000); }
+      }
+    }
   });
   ipcMain.handle('discord-migration:scan', async (event, selection: CollectorSelection) => {
     trusted(event);
     if (!collector || collecting) throw new Error('Önce Discord hesabını bağla.');
-    if (!selection || !Array.isArray(selection.channel_ids) || selection.channel_ids.length > 3000 || !Array.isArray(selection.guild_ids) || selection.guild_ids.length > 2000) throw new Error('Geçersiz veya çok büyük seçim.');
+    validateSelection(selection);
     collecting = true;
     const current = collector, activeGeneration = generation;
     if (timer) clearTimeout(timer);
@@ -102,9 +145,9 @@ export function registerDiscordMigration(getWindow: () => BrowserWindow | null) 
       const result = await current.scan(selection);
       if (generation !== activeGeneration) throw new Error('Collection cancelled');
       return result;
-    } catch {
-      if (generation === activeGeneration) disconnect();
-      throw new Error('Seçili içerik incelenemedi. Kaynağı yeniden seçerek tekrar dene.');
+    } catch (error) {
+      if (error instanceof SourceError && error.status === 401 && generation === activeGeneration) disconnect();
+      throw sourceFailure(error, 'Seçili içerik incelenemedi. Kaynağı yeniden seçerek tekrar dene.');
     } finally {
       if (generation === activeGeneration) { collecting = false; timer = setTimeout(disconnect, 10 * 60 * 1000); }
     }

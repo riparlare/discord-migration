@@ -14,7 +14,7 @@ export interface SourceRole {
   managed: boolean
 }
 
-export interface SourceGuild { id: string; name: string; roles: SourceRole[] }
+export interface SourceGuild { id: string; name: string; roles: SourceRole[]; channels_loaded?: boolean }
 export interface SourceAuthor { id: string; name: string; display_name?: string; message_count: number; unclaimed: boolean }
 export interface SourceChannel {
   id: string
@@ -216,6 +216,30 @@ export function selectionDateError(selection: ImportSelection): string | null {
   const before = selection.before ? Date.parse(selection.before) : null
   if ((after !== null && !Number.isFinite(after)) || (before !== null && !Number.isFinite(before))) return 'Geçerli bir tarih seç.'
   if (after !== null && before !== null && after >= before) return 'Bitiş tarihi başlangıçtan sonra olmalı.'
+  return null
+}
+
+const collectorErrors: Record<string, string> = {
+  SOURCE_CHANNEL_LIMIT: 'Tek aktarımda en fazla 3000 kanal seçebilirsin. Daha az sunucu veya kanal seç; mevcut seçimlerin korundu.',
+  SOURCE_GUILD_LIMIT: 'Tek aktarımda en fazla 2000 sunucu seçebilirsin. Daha az sunucu seç.',
+  SOURCE_MESSAGE_LIMIT: 'Bu seçim 100.000 mesaj sınırını aşıyor. Daha az kanal seçerek ayrı bir aktarım hazırla.',
+  SOURCE_INSPECTION_LIMIT: 'Seçili geçmiş cihazdaki 32 MB inceleme sınırını aşıyor. Daha az kanal seç.',
+  SOURCE_ARCHIVE_LIMIT: 'Hazırlanan arşiv 64 MB sınırını aşıyor. Daha az kanal veya dosya türü seç.',
+  SOURCE_ENTRY_LIMIT: 'Bu aktarım 4095 dosya ve mesaj bölümü sınırını aşıyor. Daha az kanal veya ek seç.',
+  SOURCE_TIMEOUT: 'Discord yanıtı zaman aşımına uğradı. Yeniden deneyebilir veya daha az kaynak seçebilirsin.',
+  SOURCE_RESCAN_REQUIRED: 'Mesaj geçmişi seçimini değiştirdin. Kaynağı değiştirip yeniden bağlandıktan sonra içeriği tekrar hazırla.',
+}
+
+/** Electron may wrap safe codes in its own prefix; never expose arbitrary raw errors. */
+export function collectorErrorMessage(error: unknown, fallback: string): string {
+  const message = error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' ? error.message : ''
+  const code = message.match(/(?:^|[^A-Za-z0-9_])(SOURCE_[A-Z_]+)(?=$|[^A-Za-z0-9_])/)?.[1]
+  return code && Object.hasOwn(collectorErrors, code) ? collectorErrors[code] : fallback
+}
+
+export function selectionLimitError(selection: Pick<ImportSelection, 'channel_ids' | 'guild_ids'>): string | null {
+  if (new Set(selection.channel_ids).size > 3000) return collectorErrors.SOURCE_CHANNEL_LIMIT
+  if (new Set(selection.guild_ids).size > 2000) return collectorErrors.SOURCE_GUILD_LIMIT
   return null
 }
 

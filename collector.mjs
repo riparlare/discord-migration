@@ -20,23 +20,34 @@ function duration(value) {
   return Math.ceil(seconds * 1000) + 100;
 }
 
-export function request(url, headers, signal, limit) {
+export function request(url, headers, signal, limit, deadlineMs = 30_000) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers, signal, timeout: 30_000 }, (res) => {
+    let req, settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(deadline);
+      if (error) reject(error); else resolve(value);
+    };
+    // Socket inactivity alone does not cover a stalled DNS/TLS connection.
+    const deadline = setTimeout(() => {
+      finish(new Error('SOURCE_TIMEOUT')); req?.destroy();
+    }, deadlineMs);
+    try { req = https.get(url, { headers, signal, timeout: deadlineMs }, (res) => {
       const chunks = [];
       let size = 0;
       res.on('data', (data) => {
         size += data.length;
         if (size > limit) {
-          req.destroy(); reject(new Error('Source response exceeds the size limit')); return;
+          finish(new Error('Source response exceeds the size limit')); req.destroy(); return;
         }
         chunks.push(data);
       });
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
-      res.on('error', () => reject(new Error('Source download interrupted')));
-    });
-    req.on('timeout', () => { req.destroy(); reject(new Error('Source request timed out')); });
-    req.on('error', () => reject(new Error(signal?.aborted ? 'Collection cancelled' : 'Source connection failed')));
+      res.on('end', () => finish(null, { status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', () => finish(new Error('Source download interrupted')));
+      res.on('aborted', () => finish(new Error('Source download interrupted')));
+    }); } catch { finish(new Error('Source connection failed')); return; }
+    req.on('timeout', () => { finish(new Error('SOURCE_TIMEOUT')); req.destroy(); });
+    req.on('error', () => finish(new Error(signal?.aborted ? 'Collection cancelled' : 'Source connection failed')));
   });
 }
 
@@ -53,6 +64,8 @@ export class DiscordCollector {
   #snapshots = new Map();
   #active = false;
   #scanned;
+  #channels = new Map();
+  #lastProgress = { phase: 'discovery', messages: 0, media: 0 };
   constructor(token, { transport = request, sleep = pause, progress = () => {} } = {}) {
     if (typeof token !== 'string' || !token || token.length > 4096 || /\s/.test(token)) throw new Error('Invalid credential input');
     this.#token = token;
@@ -61,6 +74,20 @@ export class DiscordCollector {
     this.progress = progress;
   }
   cancel() { this.#controller.abort(); this.#token = undefined; this.#scanned = undefined; }
+  #report(event) {
+    this.#lastProgress = { ...(event.phase === this.#lastProgress.phase ? this.#lastProgress : {}), waiting_ms: 0, ...event };
+    this.progress(this.#lastProgress);
+  }
+  #addChannels(rows, guildId) {
+    if (!Array.isArray(rows)) throw new Error('Invalid channel inventory');
+    for (const channel of rows) {
+      id(channel.id);
+      if (!TYPES.has(channel.type) && ![4, 15, 16].includes(channel.type)) continue;
+      this.#channels.set(channel.id, { id: channel.id, guild_id: guildId, parent_id: channel.parent_id ?? undefined,
+        name: channel.name || channel.recipients?.map((r) => r.global_name || r.username).join(', ') || 'Özel sohbet',
+        type: channel.type, position: channel.position ?? 0, message_count: 0, media_count: 0, authors: [], counts_known: false });
+    }
+  }
   // The desktop host may offer a separate, explicit one-time identity-verification
   // capability. Collection itself never sends credentials to Riparlare.
   async verifyWith(verify) {
@@ -82,12 +109,18 @@ export class DiscordCollector {
       // Never follow redirects or include raw server bodies in errors.
       if (result.status === 429) {
         let body; try { body = JSON.parse(result.body.toString('utf8')); } catch { throw new Error('Invalid rate limit response'); }
-        await this.#sleep(duration(body.retry_after ?? result.headers['retry-after'] ?? 1)); continue;
+        const waiting = duration(body.retry_after ?? result.headers['retry-after'] ?? 1);
+        this.#report({ ...this.#lastProgress, waiting_ms: waiting });
+        await this.#sleep(waiting);
+        this.#report({ ...this.#lastProgress, waiting_ms: 0 }); continue;
       }
       if ([500, 502, 503, 504].includes(result.status) && attempt < 5) { await this.#sleep(1000 * 2 ** attempt); continue; }
       if (result.status !== 200) throw new SourceError(result.status);
       let body; try { body = JSON.parse(result.body.toString('utf8')); } catch { throw new Error('Invalid source response'); }
-      await this.#sleep(result.headers['x-ratelimit-remaining'] === '0' ? duration(result.headers['x-ratelimit-reset-after'] ?? 1) : 350);
+      const waiting = result.headers['x-ratelimit-remaining'] === '0' ? duration(result.headers['x-ratelimit-reset-after'] ?? 1) : 0;
+      if (waiting) this.#report({ ...this.#lastProgress, waiting_ms: waiting });
+      await this.#sleep(waiting || 350);
+      if (waiting) this.#report({ ...this.#lastProgress, waiting_ms: 0 });
       return body;
     }
     throw new Error('Repeated source rate limits; retry later');
@@ -97,18 +130,10 @@ export class DiscordCollector {
     this.#active = true;
     try {
       const me = await this.#get('/users/@me'); id(me.id);
-      const guilds = [], channels = new Map(), warnings = [];
-      const add = (rows, guildId) => {
-        if (!Array.isArray(rows)) throw new Error('Invalid channel inventory');
-        for (const channel of rows) {
-          id(channel.id);
-          if (!TYPES.has(channel.type) && channel.type !== 4 && channel.type !== 15 && channel.type !== 16) continue;
-          channels.set(channel.id, { id: channel.id, guild_id: guildId, parent_id: channel.parent_id ?? undefined,
-            name: channel.name || channel.recipients?.map((r) => r.global_name || r.username).join(', ') || 'Özel sohbet',
-            type: channel.type, position: channel.position ?? 0, message_count: 0, media_count: 0, authors: [], counts_known: false });
-        }
-      };
-      try { add(await this.#get('/users/@me/channels')); } catch (error) {
+      const guilds = [], warnings = [];
+      this.#channels.clear(); this.#snapshots.clear();
+      this.#report({ phase: 'discovery', messages: 0, media: 0, guilds_discovered: 0 });
+      try { this.#addChannels(await this.#get('/users/@me/channels')); } catch (error) {
         if (!(error instanceof SourceError) || error.status === 401) throw error;
         warnings.push(`Özel sohbet listesi alınamadı (HTTP ${error.status}).`);
       }
@@ -120,29 +145,47 @@ export class DiscordCollector {
         for (const guild of batch) {
           id(guild.id);
           if (after && BigInt(guild.id) <= BigInt(after)) throw new Error('Guild pagination did not advance');
-          let roles = [], sourceChannels = [];
-          try {
-            roles = await this.#get(`/guilds/${guild.id}/roles`);
-            sourceChannels = await this.#get(`/guilds/${guild.id}/channels`);
-            if (!Array.isArray(roles) || !Array.isArray(sourceChannels)) throw new Error('Invalid guild structure');
-            add(sourceChannels, guild.id);
-            const active = await this.#get(`/guilds/${guild.id}/threads/active`);
-            add(active.threads ?? [], guild.id);
-            sourceChannels = [...sourceChannels, ...(active.threads ?? [])];
-          } catch (error) {
-            if (!(error instanceof SourceError) || error.status === 401) throw error;
-            warnings.push(`${guild.id}: sunucu yapısı kısmen alınabildi (HTTP ${error.status}).`);
-          }
-          this.#snapshots.set(guild.id, { guild, roles, channels: sourceChannels, ownership_verified: false });
-          guilds.push({ id: guild.id, name: guild.name, roles });
-          this.progress({ phase: 'discovery', messages: 0, media: 0 });
+          if (this.#snapshots.has(guild.id)) throw new Error('Duplicate source guild');
+          this.#snapshots.set(guild.id, { guild, roles: [], channels: [], loaded: false, ownership_verified: false });
+          guilds.push({ id: guild.id, name: guild.name, roles: [], channels_loaded: false });
+          this.#report({ phase: 'discovery', messages: 0, media: 0, guilds_discovered: guilds.length });
         }
         after = batch.map((g) => g.id).reduce((a, b) => BigInt(a) > BigInt(b) ? a : b);
         if (page === 99) throw new Error('Guild inventory limit reached');
       }
       warnings.push('Liste keşfedilebilen içerikle sınırlıdır; kapalı özel sohbetler ve arşivlenmiş konular eksik olabilir.');
-      this.#inventory = { guilds, channels: [...channels.values()], warnings,
+      this.#inventory = { guilds, channels: [...this.#channels.values()], warnings,
         account: { id: me.id, username: me.username || '', display_name: me.global_name || undefined } };
+      return this.#inventory;
+    } finally { this.#active = false; }
+  }
+  async inspectGuild(guildId) {
+    this.#check(); id(guildId);
+    if (!this.#inventory || this.#active) throw new Error('Discover sources before inspecting');
+    const snapshot = this.#snapshots.get(guildId);
+    if (!snapshot) throw new Error('Unknown source guild');
+    if (snapshot.loaded) return this.#inventory;
+    this.#active = true;
+    this.#report({ phase: 'discovery', guild_id: guildId, guild_name: snapshot.guild.name, messages: 0, media: 0 });
+    try {
+      let roles = [], threads = [];
+      const warn = (part, status) => {
+        const value = `${snapshot.guild.name}: ${part} alınamadı (HTTP ${status}); erişilebilen içerik kullanılacak.`;
+        if (!this.#inventory.warnings.includes(value)) this.#inventory.warnings.push(value);
+      };
+      try { roles = await this.#get(`/guilds/${guildId}/roles`); }
+      catch (error) { if (!(error instanceof SourceError) || error.status === 401) throw error; warn('rol listesi', error.status); }
+      // Optional role access must not prevent reading accessible channels.
+      const channels = await this.#get(`/guilds/${guildId}/channels`);
+      if (!Array.isArray(roles) || !Array.isArray(channels)) throw new Error('Invalid guild structure');
+      try { const active = await this.#get(`/guilds/${guildId}/threads/active`); threads = active.threads ?? []; }
+      catch (error) { if (!(error instanceof SourceError) || error.status === 401) throw error; warn('açık başlık listesi', error.status); }
+      this.#check();
+      if (!Array.isArray(threads)) throw new Error('Invalid source threads');
+      this.#addChannels([...channels, ...threads], guildId);
+      this.#snapshots.set(guildId, { ...snapshot, roles, channels: [...channels, ...threads], loaded: true });
+      this.#inventory.guilds = this.#inventory.guilds.map(guild => guild.id === guildId ? { ...guild, roles, channels_loaded: true } : guild);
+      this.#inventory.channels = [...this.#channels.values()];
       return this.#inventory;
     } finally { this.#active = false; }
   }
@@ -152,7 +195,10 @@ export class DiscordCollector {
     if (!Array.isArray(selection.channel_ids) || !Array.isArray(selection.guild_ids)) throw new Error('Invalid selection');
     const known = new Map(this.#inventory.channels.map((c) => [c.id, c]));
     const guildIds = new Set(selection.guild_ids.map(id));
-    for (const key of guildIds) if (!this.#snapshots.has(key)) throw new Error('Unknown source guild');
+    for (const key of guildIds) {
+      if (!this.#snapshots.has(key)) throw new Error('Unknown source guild');
+      if (!this.#snapshots.get(key).loaded) throw new Error('SOURCE_RESCAN_REQUIRED');
+    }
     const selected = [...new Set(selection.channel_ids.map(id))].map((key) => {
       if (!known.has(key)) throw new Error('Unknown source channel'); return known.get(key);
     }).filter((c) => (TYPES.has(c.type) || [4, 15, 16].includes(c.type)) && (!c.guild_id || guildIds.has(c.guild_id)) &&
@@ -167,13 +213,18 @@ export class DiscordCollector {
     try {
       for (const channel of selected) {
         let cursor, exhausted = false;
+        const scanHistory = selection.include_messages !== false && TYPES.has(channel.type) && (![2, 13].includes(channel.type) || selection.include_voice_text);
+        // Keep already-listed structure even when channel access was revoked.
+        // A failed read is recorded explicitly; it never permits another history read.
+        const record = { metadata: { ...(this.#snapshots.get(channel.guild_id)?.channels.find((c) => c.id === channel.id) ?? channel) }, pages: [], scannedHistory: scanHistory };
+        records.set(channel.id, record);
         try {
           const structural = [4, 15, 16].includes(channel.type);
           const metadata = structural ? { ...(this.#snapshots.get(channel.guild_id)?.channels.find((c) => c.id === channel.id) ?? channel) } : await this.#get(`/channels/${channel.id}`);
           if (metadata.id !== channel.id) throw new Error('Channel identity changed');
           metadata.name ||= channel.name;
-          const scanHistory = selection.include_messages !== false && TYPES.has(channel.type) && (![2, 13].includes(channel.type) || selection.include_voice_text);
-          const pages = []; records.set(channel.id, { metadata, pages, scannedHistory: scanHistory });
+          record.metadata = metadata;
+          const pages = record.pages;
           for (let page = 0; scanHistory && page < 1000; page++) {
             const rows = await this.#get(`/channels/${channel.id}/messages`, { limit: '100', ...(cursor ? { before: cursor } : {}) });
             if (!Array.isArray(rows) || rows.length > 100) throw new Error('Invalid message page');
@@ -194,7 +245,7 @@ export class DiscordCollector {
             if (bytes > 32 * 1024 * 1024) throw new Error('Local inspection limit reached; choose fewer channels');
             pages.push(rows);
             cursor = rows.map((m) => m.id).reduce((a, b) => BigInt(a) < BigInt(b) ? a : b);
-            this.progress({ phase: 'messages', channel_id: channel.id, messages: count, media: 0 });
+            this.#report({ phase: 'messages', channel_id: channel.id, messages: count, media: 0 });
           }
         } catch (error) {
           if (!(error instanceof SourceError) || error.status === 401) throw error;
@@ -240,7 +291,7 @@ export class DiscordCollector {
     if (Number.isNaN(after) || Number.isNaN(before) || after >= before) throw new Error('Invalid date range');
     this.#active = true;
     const zip = new StoredZip(MAX_ZIP), failures = [...scanned.failures];
-    let count = 0, mediaCount = 0, downloaded = 0;
+    let count = 0, mediaCount = 0, downloaded = 0, completed = false;
     try {
       const included = new Set(selection.channel_ids);
       for (const c of selected) {
@@ -288,20 +339,26 @@ export class DiscordCollector {
                 } catch {
                   this.#check(); failures.push({ channel_id: channel.id, message_id: message.id, attachment_id: attachment.id, code: 'media_unavailable_or_limit' });
                 }
-              this.progress({ phase: 'media', channel_id: channel.id, messages: count, media: mediaCount });
+              this.#report({ phase: 'media', channel_id: channel.id, messages: count, media: mediaCount });
             }
             retained.push(message); count++;
           }
           if (retained.length) zip.add(`channels/${channel.id}/${String(page).padStart(8, '0')}.json`, JSON.stringify({ channel: metadata, messages: retained }));
         }
       }
-      this.progress({ phase: 'packing', messages: count, media: mediaCount });
+      this.#report({ phase: 'packing', messages: count, media: mediaCount });
       zip.add('migration-manifest.json', JSON.stringify({ schema: 1, source: 'device_user_token_export',
         account: this.#inventory.account,
         attribution_trusted: false, completeness: 'not_proven', warnings: this.#inventory.warnings,
         requested_channel_ids: selected.map((c) => c.id), channels: scanned.states.filter((s) => included.has(s.id)), failures }));
-      return zip.finish();
-    } finally { this.cancel(); this.#active = false; }
+      const bytes = zip.finish(); completed = true;
+      return bytes;
+    } finally {
+      // A bounded packing error must not discard the inspected history. The host
+      // retains it only until idle expiry/cancel, allowing a smaller retry.
+      if (completed) this.cancel();
+      this.#active = false;
+    }
   }
 }
 
