@@ -1,10 +1,11 @@
 # In-app migration reference modules
 
-This directory publishes the migration-specific UI and main-process bridge used by the Riparlare 1.22.x workflow. It is **reference source for a host application, not a standalone application**. The private application/backend, generated clients, existing application source, styles, assets and operational configuration are not included. These modules have host imports by design; copying this directory alone does not produce a buildable app or working server.
+This directory publishes migration-specific UI and main-process bridge reference source for the Riparlare1.23 native-history workflow. It is **reference source for a host application, not a standalone application**. The private application/backend, generated clients, existing application source, styles, assets and operational configuration are not included. These modules have host imports by design; copying this directory alone does not produce a buildable app or working server.
 
 ## Included files
 
-- `ui/components/migration/`: `DiscordImportWizard`, `SourceTree`, `ImportOptions`, `ImportedHistory` and dedicated synthetic UI tests.
+- `ui/components/migration/`: `DiscordImportWizard`, `SourceTree`, `ImportOptions`, legacy `ImportedHistory`, `NativeHistoryStatus`, `ExternalIdentityBadge` and synthetic UI tests.
+- `ui/lib/nativeImportMedia.ts` and `useNativeImportAttachments.ts`: fixed-endpoint validation and authenticated Blob loading; map the hook to the host hooks path if desired.
 - `ui/lib/discordMigration.ts`: selection helpers, DTOs, protected-media URL validation and the feature HTTP adapter; adjacent helper tests.
 - `native/discord-migration.ts`: Electron main-process IPC registration; imports the public root `../../collector.mjs`.
 - `native/bridge.d.ts`: renderer bridge contract to merge into the host API declaration.
@@ -26,13 +27,15 @@ Existing `@/...` imports are **host adapter contracts**, not missing private imp
 | `@/lib/apiError` | Export `apiErrorMessage(error, t, fallback): string`, returning sanitized display text without raw credentials/headers/request bodies. |
 | `@/lib/queryClient` | Export the TanStack Query `QueryClient` instance used by the host provider, supporting `setQueryData` for the `['settings-user-me']` native profile cache. The host owns refreshing existing guild/DM lists when imported destinations become available. |
 | `@/stores/authStore` | Selector hook `useAuthStore(selector)` and `useAuthStore.getState()`, exposing native `token`, `user`, `setUser(user)`. The feature reads `user.id` and `user.discriminator`. Never persist the Discord source credential in this store. |
+| `@/stores/messageStore` | `useMessageStore.getState().removeChannelMessages(channelId)`, clearing a projected channel's cached timeline. |
+| `@/stores/uiStore` | Selector hook exposing `openUserProfile(userId,guildId,x,y)` for a separate verified-account link. |
 | `@/types` | Type-only `DtoUser`, including native `id`, optional `discriminator` and profile fields preserved by the host store. No generated client needs copying here. |
 | `@/lib/utils` | Export `cn(...classes): string` for conditional class joining. |
 | `@/lib/discordMigration` | Map to the included feature helper, exporting its API/selection functions and DTOs. |
 
 Provide Tailwind utility processing, arbitrary-value classes and semantic theme tokens such as background/foreground, muted, card, sidebar, border, primary and destructive. No stylesheet, branding or assets are bundled. Browser globals include `window`, File/FormData, AbortController, Blob URLs and `document`; these are client components.
 
-Mount `<DiscordImportWizard onClose={...} />` in an authenticated host route/settings panel under router/query providers. Mount `<ImportedHistory channelId={nativeChannelId} />` beside native guild/DM chat. Keep source/native IDs distinct strings. Do not insert imported rows into a native editable message store or derive source dates from native snowflakes. Existing native group management is a host responsibility; source authors are not fabricated native participants.
+Mount `<DiscordImportWizard onClose={...} />` in an authenticated host route/settings panel under router/query providers. Mount `<NativeHistoryStatus channelId={nativeChannelId} channel={nativeChannel} />` beside the normal timeline. Completed projection has no separate archive panel. The host must read imported history through ordinary authorized message APIs, preserve zero/negative `history_start_position`, and refetch on `native-history-projected`. The server creates stable source-time native IDs and no-login profiles; editable archive labels never authenticate authors. Source/native IDs remain distinct strings. The host owns ordinary group membership and message editing authorization.
 
 ## Backend contract
 
@@ -44,6 +47,8 @@ The HTTP adapter requires authenticated native-human APIs relative to the config
 | `GET /discord-imports` / `GET /discord-imports/:id` | Own jobs/status/destination/progress only. |
 | `POST /discord-imports/:id/preview` | Server-validated full selection, exact counts/warnings and source-bound hash. |
 | `POST /discord-imports/:id/commit` | `{selection,selection_hash}`, idempotent queue/destination creation and bounded progress. |
+| `POST /discord-imports/:id/project-native` | Own committed job, durable idempotent projection/retry, returning full inventory with native_projection status. |
+| `GET /discord-imports/channels/:channel_id/attachments/:attachment_id` | Ordinary current channel/participant authorization; no token URL or uploader-only check. |
 | `GET /discord-imports/channels/:channel_id/messages` | `before`/`limit` source history page; original uploader plus current destination access. |
 | `GET /discord-imports/:id/media/:channel/:message/:attachment` | Exact selected-media authorization/private bytes; no arbitrary URL fetch. |
 | `PATCH /user/me/discriminator` | Optional native handle change; 409 taken/400 invalid are nonfatal to importing. |
@@ -75,7 +80,9 @@ Normal flow: own-credential input → names-only source list → selected-guild 
 
 Automation-risk acceptance is **not** server credential-transfer consent. The independent default-off linking choice expressly authorizes one-time verification, enforced by the bridge's `accepted_server_verification:true`, native JWT and expected discovered Discord ID. Only safe link metadata returns to the renderer. The default collection path never sends its source credential to Riparlare.
 
-Username adoption is another independent default-off choice. Names may differ, identity binds only an actual verified Discord ID, and a taken/invalid native name preserves the existing name while importing continues. Uploaded labels are untrusted, so adoption does not prove identity. Retained history/media stays uploader-only, also requiring current destination access, after others join or authors verify.
+Username adoption is another independent default-off choice. Names may differ, identity binds only an actual verified Discord ID, and a taken/invalid native name preserves the existing name while importing continues. Uploaded labels are untrusted, so adoption does not prove identity. After projection, guild history/media follows ordinary destination permissions; DM/group/private-thread history remains participant scoped. A verified claim links a native account to an unclaimed profile without granting another person's private conversation or source-server roles.
+
+Additional host types: `DtoChannel.history_start_position?:number`, `history_import?:{state:'projecting'|'complete'|'failed',legacy_archive_visible:boolean}`; `DtoUser.external_identity?:ExternalIdentity`, where `ExternalIdentity={provider:'discord',subject:string,unclaimed:boolean,linked_user_id?:string}`; `DtoAttachment.import_status?:'ready'|'source_media_unavailable'`. Normal message DTOs expose `imported_from` with provider, original channel/message IDs, source timestamp and `attribution_verified:false`. Protected media must use authenticated Blob loading and revoke object URLs; missing source bytes must remain explicit.
 
 ## Tests and portability
 

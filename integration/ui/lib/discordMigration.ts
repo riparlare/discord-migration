@@ -41,6 +41,7 @@ export interface ImportInventory {
   selection?: ImportSelection
   progress?: { completed?: number; total?: number; stage?: string; state?: string; processed?: number }
   error?: string
+  native_projection?: { state: 'pending' | 'projecting' | 'complete' | 'failed'; messages: number; total: number; error?: string }
   /** Untrusted source metadata: useful for an optional name offer, never identity proof. */
   account?: DiscordSourceAccount
 }
@@ -96,19 +97,24 @@ export function normalizeInventory(data: ImportInventory): ImportInventory {
 }
 
 const warningLabels: Record<string, string> = {
+  native_destination_permissions_apply: 'Mesajlar normal sohbete eklenir. Sunucu geçmişi kanal izinlerine, özel sohbetler katılımcı erişimine göre görünür.',
+  native_private_thread_to_private_group: 'Özel başlıklar özel grup sohbeti olarak korunur; sunucunun diğer üyelerine otomatik açılmaz. Katılımcıları grup sohbetinden yönetebilirsin.',
+  native_everyone_permissions_review: 'Varsayılan rol ve kanal izinlerini başkalarını davet etmeden önce incele.',
+  native_overwrites_applied_roles_unassigned: 'Desteklenen kanal izinleri korunur; kaynak roller kişilere otomatik atanmaz.',
+  native_unresolved_member_overwrites_private: 'Eşleştirilemeyen kişiye özel izinler nedeniyle bazı kanallar özel tutuldu. Paylaşmadan önce kanal izinlerini incele.',
   source_announcement_mapped_to_text: 'Duyuru kanalları normal yazılı kanal olarak oluşturulur; duyuru yayımlama özelliği aktarılmaz.',
   source_stage_mapped_to_voice: 'Sahne kanalları normal sesli kanal olarak oluşturulur; konuşmacı ve dinleyici düzeni aktarılmaz.',
   source_forum_media_mapped_to_text: 'Forum ve medya kanalları yazılı kanala dönüştürülür; kaynak kanalın özel görünümü korunmaz.',
   source_private_thread_semantics_require_review: 'Özel başlıkların üyelik ve görünürlük düzeni aynı biçimde uygulanamaz. Paylaşmadan önce yeni kanal izinlerini incele.',
   source_guild_unknown_mapped_to_private_group: 'Sunucusu belirlenemeyen bir sohbet, yalnızca sana açık bir grup olarak oluşturulur.',
-  imported_history_owner_only: 'Aktarılan geçmiş yalnızca sana görünür; sonradan sunucuya eklenen üyeler bu eski mesajlara otomatik erişemez.',
+  imported_history_owner_only: 'Normal sohbete dönüştürülene kadar kaynak arşiv yalnızca sana görünür. Dönüştürülen sunucu mesajlarına kanal izinleriyle erişilir; özel sohbetler katılımcılarla sınırlıdır.',
   archive_attribution_unverified: 'Arşivdeki yazar adları ve metinler bağımsız olarak doğrulanmış kimlik veya sahiplik kanıtı değildir.',
   personal_export_missing_counterpart_messages: 'Discord veri paketi yalnızca kendi gönderdiğin mesajları içeriyor. Karşı tarafların geçmişi bu kaynakta bulunmayabilir.',
   archive_completeness_unverified: 'Kaynak geçmişinin eksiksiz olduğu doğrulanamadı. Silinmiş veya erişilemeyen mesajlar bulunmayabilir.',
   mixed_source_completeness: 'Arşiv farklı kaynaklar içeriyor; bazı sohbetlerin geçmişi eksik olabilir.',
   source_ownership_not_transferred: 'Yeni bir kopya oluşturulur; Discord sunucusunun sahipliği devredilmez.',
   source_permissions_unverified: 'Kaynak izinleri bir arşivden okundu; güncel Discord erişim haklarını kanıtlamaz.',
-  member_overwrites_unresolved_owner_only: 'Bazı kişiye özel kanal izinleri hesaplarla eşleştirilemedi. Bu geçmiş yalnızca sana açık tutulur.',
+  member_overwrites_unresolved_owner_only: 'Bazı kişiye özel kaynak izinleri eşleştirilemedi. Hedef kanal izinlerini gözden geçir; kaynak kimliği başka bir gerçek hesaba erişim hakkı vermez.',
   unsupported_permission_bits: 'Bazı Discord izinlerinin Riparlare karşılığı yok. Desteklenmeyen yetkiler verilmez.',
   imported_roles_unassigned: 'Seçili roller oluşturulur; karşı hesaplar henüz eşleştirilmediği için kimseye otomatik atanmaz.',
   channel_overwrites_preserved_owner_only: 'Kaynak kanal izinleri kaydedilir; çözülmeyen izinler üzerinden başkasına geçmiş erişimi verilmez.',
@@ -324,6 +330,9 @@ export const discordMigrationApi = {
   },
   async get(id: string, signal?: AbortSignal): Promise<ImportInventory> {
     return normalizeInventory((await axiosInstance.get<ImportInventory>(`${root()}/${encodeURIComponent(id)}`, { signal })).data)
+  },
+  async projectNative(id: string): Promise<ImportInventory> {
+    return normalizeInventory((await axiosInstance.post<ImportInventory>(`${root()}/${encodeURIComponent(id)}/project-native`)).data)
   },
   async preview(id: string, selection: ImportSelection, signal?: AbortSignal): Promise<ImportPreview> {
     const data = (await axiosInstance.post<ImportPreview>(`${root()}/${encodeURIComponent(id)}/preview`, selection, { signal })).data

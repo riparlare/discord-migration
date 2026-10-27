@@ -9,7 +9,7 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 vi.mock('@/lib/discordMigration', async importOriginal => {
   const original = await importOriginal<typeof import('@/lib/discordMigration')>()
   return { ...original, discordMigrationApi: {
-    upload: vi.fn(), list: vi.fn(), get: vi.fn(), preview: vi.fn(), commit: vi.fn(), messages: vi.fn(), media: vi.fn(), adoptUsername: vi.fn(),
+    upload: vi.fn(), list: vi.fn(), get: vi.fn(), preview: vi.fn(), commit: vi.fn(), projectNative: vi.fn(), messages: vi.fn(), media: vi.fn(), adoptUsername: vi.fn(),
   } }
 })
 
@@ -63,6 +63,48 @@ describe('selective import UI', () => {
     vi.mocked(discordMigrationApi.preview).mockResolvedValue({ selection_hash: 'server-preview', counts: { channels: 1, messages: 2, media: 0, excluded_messages: 3 }, warnings: [] })
     vi.mocked(discordMigrationApi.commit).mockResolvedValue({ ...inventory, status: 'committed', destinations: [{ source_id: '300', name: 'genel', guild_id: '500', channel_id: '600' }] })
     vi.mocked(discordMigrationApi.adoptUsername).mockResolvedValue('updated')
+  })
+
+  it('retries native projection of an existing job without source collection or import recommit', async () => {
+    const pending: ImportInventory = { ...inventory, status: 'committed', native_projection: { state: 'failed', messages: 1, total: 5 } }
+    const complete: ImportInventory = { ...pending, native_projection: { state: 'complete', messages: 5, total: 5 } }
+    vi.mocked(discordMigrationApi.upload).mockResolvedValue(pending)
+    vi.mocked(discordMigrationApi.projectNative).mockResolvedValue(complete)
+    const user = userEvent.setup()
+    renderWizard()
+    fireEvent.change(screen.getByLabelText('Discord ZIP arşivi seç'), { target: { files: [new File(['synthetic'], 'source.zip')] } })
+    await user.click(await screen.findByRole('button', { name: 'Sohbete aktarımı yeniden dene' }))
+    await screen.findByText(/Mesajlar ve dosyalar normal sohbetlere aktarıldı/)
+    expect(discordMigrationApi.projectNative).toHaveBeenCalledWith('job-1')
+    expect(discordMigrationApi.commit).not.toHaveBeenCalled()
+    expect(discordMigrationApi.preview).not.toHaveBeenCalled()
+    expect(discordMigrationApi.upload).toHaveBeenCalledTimes(1)
+  })
+
+  it('continues polling a committed pending projection through projecting to completion', async () => {
+    let poll: (() => void) | undefined
+    const interval = vi.spyOn(window, 'setInterval').mockImplementation((callback, delay) => {
+      if (delay === 1800) poll = callback as () => void
+      return 12345 as unknown as ReturnType<typeof window.setInterval>
+    })
+    try {
+      const pending: ImportInventory = { ...inventory, status: 'committed', native_projection: { state: 'pending', messages: 0, total: 5 } }
+      vi.mocked(discordMigrationApi.upload).mockResolvedValue(pending)
+      vi.mocked(discordMigrationApi.get)
+        .mockResolvedValueOnce({ ...pending, native_projection: { state: 'projecting', messages: 2, total: 5 } })
+        .mockResolvedValueOnce({ ...pending, native_projection: { state: 'complete', messages: 5, total: 5 } })
+      renderWizard()
+      fireEvent.change(screen.getByLabelText('Discord ZIP arşivi seç'), { target: { files: [new File(['synthetic'], 'source.zip')] } })
+      await screen.findByText(/Mesajlar sohbete aktarım sırasında bekliyor/)
+      expect(poll).toBeTypeOf('function')
+      await act(async () => { poll?.(); await Promise.resolve() })
+      await screen.findByText(/Mesajlar sohbetlere hazırlanıyor · 2 \/ 5/)
+      await act(async () => { poll?.(); await Promise.resolve() })
+      await screen.findByText(/Mesajlar ve dosyalar normal sohbetlere aktarıldı/)
+      expect(discordMigrationApi.get).toHaveBeenCalledTimes(2)
+      expect(discordMigrationApi.commit).not.toHaveBeenCalled()
+      expect(discordMigrationApi.projectNative).not.toHaveBeenCalled()
+    } finally { interval.mockRestore() }
   })
 
   it('requires server preview and explicit confirmation and sends author exclusions to commit', async () => {

@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { apiErrorMessage } from '@/lib/apiError'
 import { queryClient } from '@/lib/queryClient'
 import { useAuthStore } from '@/stores/authStore'
+import { useMessageStore } from '@/stores/messageStore'
 import type { DtoUser } from '@/types'
 import { canonicalSelection, collectorErrorMessage, destinationPath, discordMigrationApi, emptySelection, importWarningText, importUploadErrorMessage, rejectedImportSnapshot, normalizeInventory, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type DiscordSourceAccount, type ImportInventory, type ImportPreview, type ImportSelection, type SourceChannel, type SourceGuild, type UsernameAdoption } from '@/lib/discordMigration'
 import SourceTree from './SourceTree'
@@ -71,6 +72,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   const requestSerial = useRef(0)
   const selectionRevision = useRef(0)
   const mounted = useRef(true)
+  const refreshedProjection = useRef<string | null>(null)
   const currentFingerprint = useMemo(() => inventory && selection ? selectionFingerprint(selection, inventory) : '', [inventory, selection])
   const validPreview = Boolean(preview && previewFingerprint === currentFingerprint)
   const canonical = useMemo(() => inventory && selection ? canonicalSelection(selection, inventory) : null, [inventory, selection])
@@ -98,7 +100,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   useEffect(() => bridge?.onProgress(progress => { if (mounted.current) setCollectorProgress(progress) }), [bridge])
 
   useEffect(() => {
-    if (!inventory || !activeStatus(inventory.status)) return
+    if (!inventory || (!activeStatus(inventory.status) && !['pending', 'projecting'].includes(inventory.native_projection?.state ?? ''))) return
     const controller = new AbortController()
     const timer = window.setInterval(() => {
       discordMigrationApi.get(inventory.id, controller.signal).then(updated => {
@@ -110,7 +112,26 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       })
     }, 1800)
     return () => { controller.abort(); window.clearInterval(timer) }
-  }, [inventory?.id, inventory?.status])
+  }, [inventory?.id, inventory?.status, inventory?.native_projection?.state])
+
+  useEffect(() => {
+    if (!inventory || inventory.native_projection?.state !== 'complete' || refreshedProjection.current === inventory.id) return
+    refreshedProjection.current = inventory.id
+    for (const key of ['dm-channels', 'dm-channel', 'guilds', 'channels', 'channel', 'members', 'user']) {
+      void queryClient.invalidateQueries({ queryKey: [key] })
+    }
+    const channelIds = inventory.destinations?.flatMap(destination => destination.channel_id ? [destination.channel_id] : []) ?? []
+    for (const id of channelIds) useMessageStore.getState().removeChannelMessages(id)
+    window.dispatchEvent(new CustomEvent('native-history-projected', { detail: { channelIds } }))
+  }, [inventory])
+
+  async function projectNative() {
+    if (!inventory || busy) return
+    setBusy('resume'); setError(null)
+    try { setInventory(retainSourceWarnings(await discordMigrationApi.projectNative(inventory.id), inventory.warnings)) }
+    catch { setError('Geçmişin sohbete aktarımı başlatılamadı. Kaynak arşiv korundu; biraz sonra yeniden deneyebilirsin.') }
+    finally { if (mounted.current) setBusy(null) }
+  }
 
   useEffect(() => { setConfirmed(false) }, [currentFingerprint])
 
@@ -401,11 +422,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     setToken(''); setInventory(null); setSelection(null); setDesktopSource(false); setDesktopScanned(false); setLoadingGuildId(null); setPreview(null); setStep(0); setError(null)
     setLinkResult(null); setAdoptSourceUsername(false); setUsernameResult(null); setServerVerificationConsent(false)
   }
+  const projectionActive = ['pending', 'projecting'].includes(inventory?.native_projection?.state ?? '')
   const sourceBanner = desktopSource
     ? desktopScanned
       ? 'Seçili geçmiş şu anda yalnızca cihazında. Hariç tutacağın kişileri, tarihleri ve ek türlerini seç; bu içerikler ayıklanmadan Riparlare’ye gönderilmez.'
       : 'Önce kanalları seç. Seçili geçmiş yalnızca cihazında incelenecek; ardından kişileri ve tarihleri ayıklayıp Riparlare’ye göndereceksin.'
-    : 'Hiçbir karşı hesap otomatik eklenmez. Aktarılan geçmiş yalnızca sana görünür; yeni mesajlar için normal kanal izinleri geçerlidir.'
+    : 'Kaynak yazarlar sahiplenilmemiş profillerle gösterilir. Normal sohbete aktarılan geçmişte kanal izinleri, özel sohbetlerde katılımcı erişimi geçerlidir. Hesap sahiplenme özel sohbet erişimini devretmez.'
   const loadingGuildName = collectorProgress?.guild_name || inventory?.guilds.find(guild => guild.id === loadingGuildId)?.name
   const waitingText = (collectorProgress?.waiting_ms ?? 0) > 0
     ? ` · Discord sınırı nedeniyle ${Math.ceil((collectorProgress?.waiting_ms ?? 0) / 1000)} sn bekleniyor` : ''
@@ -449,16 +471,17 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(260px,35%)_1fr] md:overflow-hidden"><div className="h-80 border-b md:h-auto md:min-h-0 md:border-b-0 md:border-r"><SourceTree inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} onFocus={setFocusedId} onInspectGuild={desktopSource ? (id, selectAll) => void inspectGuild(id, selectAll) : undefined} onSelectAll={() => void selectAllSources()} loadingGuildId={loadingGuildId} inspectionDisabled={!!busy} /></div><ImportOptions inventory={inventory} selection={selection} onChange={changeSelection} focusedId={focusedId} /></main>
     </>}
 
-    {step === 2 && inventory && preview && <main className="min-h-0 flex-1 overflow-y-auto px-5 py-7 sm:px-8"><div className="mx-auto max-w-3xl"><h2 className="text-2xl font-semibold">Seçtiklerin böyle gelecek</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Bu önizleme sunucuda seçimlerine göre hesaplandı. Aktarılan geçmiş yalnızca sana görünür. Karşı hesaplar oluşturulmaz veya gruplara otomatik eklenmez.</p><dl className="mt-7 grid grid-cols-2 gap-x-6 gap-y-5 border-y py-5 sm:grid-cols-4">{([['Kanal', preview.counts.channels], ['Mesaj', preview.counts.messages], ['Ek', preview.counts.media], ['Hariç mesaj', preview.counts.excluded_messages]] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 text-2xl font-semibold tabular-nums">{value.toLocaleString('tr-TR')}</dd></div>)}</dl>
+    {step === 2 && inventory && preview && <main className="min-h-0 flex-1 overflow-y-auto px-5 py-7 sm:px-8"><div className="mx-auto max-w-3xl"><h2 className="text-2xl font-semibold">Seçtiklerin böyle gelecek</h2><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Bu önizleme sunucuda seçimlerine göre hesaplandı. Kaynak yazarlar giriş yapamayan, sahiplenilmemiş profillerle gösterilir. Normal sohbete dönüştürülen geçmiş kanal izinlerine tabidir; özel sohbetlere başka gerçek hesaplar otomatik eklenmez.</p><dl className="mt-7 grid grid-cols-2 gap-x-6 gap-y-5 border-y py-5 sm:grid-cols-4">{([['Kanal', preview.counts.channels], ['Mesaj', preview.counts.messages], ['Ek', preview.counts.media], ['Hariç mesaj', preview.counts.excluded_messages]] as const).map(([label, value]) => <div key={label}><dt className="text-xs text-muted-foreground">{label}</dt><dd className="mt-1 text-2xl font-semibold tabular-nums">{value.toLocaleString('tr-TR')}</dd></div>)}</dl>
       <div className="mt-6 space-y-3 text-sm"><p><span className="text-muted-foreground">Sunucular: </span>{inventory.guilds.filter(guild => canonical?.guild_ids.includes(guild.id)).map(guild => guild.name).join(', ') || 'Seçili özel / grup sohbetleri'}</p><p><span className="text-muted-foreground">Hariç tutulan kişiler: </span>{selection?.excluded_author_ids.length ?? 0} tüm aktarımda, {Object.values(selection?.channel_excluded_author_ids ?? {}).reduce((sum, ids) => sum + ids.length, 0)} kanal bazında</p><p><span className="text-muted-foreground">Mesaj aralığı: </span>{canonical?.after ? new Date(canonical.after).toLocaleString() : 'Başlangıçtan'} — {canonical?.before ? new Date(canonical.before).toLocaleString() : 'Sonuna kadar'}</p></div>
       <section className="mt-6 rounded-lg border p-4"><h3 className="text-sm font-semibold">Kullanıcı adını sen seç</h3><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Riparlare ve Discord kullanıcı adlarının aynı olması gerekmez. {ownUsername ? `Riparlare’de @${ownUsername} olarak kalabilirsin.` : 'Mevcut Riparlare kullanıcı adın korunur.'}</p>{inventory.account?.username && <label className="mt-4 flex items-start gap-3 text-sm leading-relaxed"><input type="checkbox" checked={adoptSourceUsername} onChange={event => setAdoptSourceUsername(event.target.checked)} disabled={!!busy} className="mt-1 h-4 w-4 shrink-0 accent-white" /><span>Discord’daki <strong>@{inventory.account.username}</strong> kullanıcı adını Riparlare’de de kullanmak istiyorum.<span className="mt-1 block text-xs text-muted-foreground">Yalnızca bu kutuyu seçersen, aktarım isteği kabul edildiğinde kullanıcı adı değişikliği ayrı olarak uygulanır. Ad alınmışsa mevcut adın korunur ve aktarım devam eder. Bu seçim Discord hesabının sahipliğini doğrulamaz.</span></span></label>}</section>
       {[...new Set([...inventory.warnings, ...preview.warnings])].length > 0 && <section className="mt-6 rounded-lg border border-amber-500/25 bg-amber-500/5 p-4"><h3 className="flex items-center gap-2 text-sm font-semibold"><AlertTriangle className="h-4 w-4 text-amber-400" />Aktarmadan önce bilmen gerekenler</h3><ul className="mt-3 list-disc space-y-2 pl-5 text-sm leading-relaxed text-muted-foreground">{[...new Set([...inventory.warnings, ...preview.warnings])].slice(0, 80).map((warning, index) => <li key={`${index}-${warning}`}>{importWarningText(warning)}</li>)}</ul></section>}
       {!validPreview && <p role="alert" className="mt-5 text-sm text-amber-400">Seçimler değişti. Aktarmadan önce önizlemeyi yenile.</p>}
       <label className="mt-7 flex items-start gap-3 rounded-lg border p-4 text-sm leading-relaxed"><input type="checkbox" checked={confirmed} disabled={!validPreview || !!busy} onChange={event => setConfirmed(event.target.checked)} className="mt-1 h-4 w-4 shrink-0 accent-white" /><span>Seçimleri ve eksikleri inceledim. Seçili içeriklerden yeni sunucu ve sohbetler oluşturulsun. Mevcut sohbetlerim değiştirilmesin.</span></label></div></main>}
 
-    {step === 3 && inventory && <main className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8"><div className="mx-auto max-w-3xl"><div className="flex items-center gap-4">{doneStatus(inventory.status) ? <CheckCircle2 className="h-10 w-10 text-emerald-400" /> : activeStatus(inventory.status) ? <Loader2 className="h-10 w-10 animate-spin text-muted-foreground" /> : <AlertTriangle className="h-10 w-10 text-amber-400" />}<div><h2 className="text-2xl font-semibold">{doneStatus(inventory.status) ? 'Seçtiklerin Riparlare’de' : activeStatus(inventory.status) ? 'İçerik aktarılıyor' : 'Aktarım durumu'}</h2><p className="mt-1 text-sm text-muted-foreground">{doneStatus(inventory.status) ? 'Aşağıdaki bağlantılardan oluşturulan sohbetleri açabilirsin.' : 'Bu ekranı kapatsan da sunucuda başlayan işlem durumunu buradan yeniden açabilirsin.'}</p></div></div>
+    {step === 3 && inventory && <main className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8"><div className="mx-auto max-w-3xl"><div className="flex items-center gap-4">{doneStatus(inventory.status) && !projectionActive ? <CheckCircle2 className="h-10 w-10 text-emerald-400" /> : (activeStatus(inventory.status) || projectionActive) ? <Loader2 className="h-10 w-10 animate-spin text-muted-foreground" /> : <AlertTriangle className="h-10 w-10 text-amber-400" />}<div><h2 className="text-2xl font-semibold">{doneStatus(inventory.status) && !projectionActive ? 'Seçtiklerin Riparlare’de' : (activeStatus(inventory.status) || projectionActive) ? 'İçerik aktarılıyor' : 'Aktarım durumu'}</h2><p className="mt-1 text-sm text-muted-foreground">{doneStatus(inventory.status) && !projectionActive ? 'Aşağıdaki bağlantılardan oluşturulan sohbetleri açabilirsin.' : 'Bu ekranı kapatsan da sunucuda başlayan işlem durumunu buradan yeniden açabilirsin.'}</p></div></div>
+      {inventory.native_projection && <section className="mt-5 rounded-lg border p-4 text-sm"><h3 className="font-semibold">Normal sohbet geçmişi</h3><p role="status" className="mt-2 text-muted-foreground">{inventory.native_projection.state === 'complete' ? 'Mesajlar ve dosyalar normal sohbetlere aktarıldı. Sunucularda kanal izinleri, özel sohbetlerde katılımcı erişimi geçerlidir.' : inventory.native_projection.state === 'pending' ? 'Mesajlar sohbete aktarım sırasında bekliyor. Bu ekran işlem durumunu otomatik yeniler.' : inventory.native_projection.state === 'projecting' ? `Mesajlar sohbetlere hazırlanıyor · ${inventory.native_projection.messages} / ${inventory.native_projection.total}` : inventory.native_projection.state === 'failed' ? 'Geçmişin sohbete aktarımı tamamlanamadı. Kaynak arşiv korundu.' : 'Kaynak arşiv hazır. Geçmişi normal sohbet mesajlarına dönüştürebilirsin.'}</p>{inventory.native_projection.state === 'failed' && <button type="button" disabled={!!busy} onClick={() => void projectNative()} className="mt-3 rounded-md border px-3 py-2 hover:bg-accent disabled:opacity-50">{inventory.native_projection.state === 'failed' ? 'Sohbete aktarımı yeniden dene' : 'Geçmişi sohbete aktar'}</button>}</section>}
       {inventory.progress && <div className="mt-6"><div className="mb-2 flex justify-between text-sm"><span>{inventory.progress.stage || 'Hazırlanıyor'}</span><span>{inventory.progress.completed ?? 0} / {inventory.progress.total ?? '?'}</span></div>{!!inventory.progress.total && <progress value={inventory.progress.completed ?? 0} max={inventory.progress.total} className="h-2 w-full accent-white" />}</div>}
-      <p className="mt-6 rounded-lg bg-muted/50 p-4 text-sm leading-relaxed text-muted-foreground">Eski mesajlar Discord kaynağı ve kaynak tarihiyle işaretlenir. Hesap sahiplenme, başka birinin özel geçmişine erişim sağlamaz. Aktarılan geçmiş yalnızca sana görünür.</p>
+      <p className="mt-6 rounded-lg bg-muted/50 p-4 text-sm leading-relaxed text-muted-foreground">Eski mesajlar Discord kaynağı ve kaynak tarihiyle işaretlenir. Hesap sahiplenme, başka birinin özel geçmişine erişim sağlamaz. Normal sohbete dönüştürülen geçmişte kanal ve katılımcı izinleri uygulanır; dönüştürme öncesi kaynak arşiv yalnızca sana açıktır.</p>
       {inventory.error && <div role="status" className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 text-sm leading-relaxed"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" /><span>{inventory.error === 'some_selected_media_unavailable' ? 'Sohbet aktarımı tamamlandı, ancak bazı seçili ekler alınamadı. Eksik dosyalar ilgili mesajlarda belirtilir.' : 'Bazı öğeler aktarılamadı. Durumu yenileyip aynı aktarım üzerinden yeniden deneyebilirsin.'}</span></div>}
       {usernameResult && <div role="status" className="mt-4 rounded-lg border p-4 text-sm leading-relaxed">{usernameResult === 'saving' ? 'Seçtiğin kullanıcı adı uygulanıyor…' : usernameResult === 'updated' ? 'Seçtiğin Discord kullanıcı adı Riparlare’de de uygulandı.' : usernameResult === 'taken' ? 'Bu kullanıcı adı Riparlare’de başka biri tarafından kullanılıyor. Mevcut kullanıcı adın korundu; sohbet aktarımın bundan etkilenmedi.' : usernameResult === 'invalid' ? 'Discord kullanıcı adın Riparlare’nin ad kurallarına uymuyor. Mevcut kullanıcı adın korundu; bu durum sohbet aktarımını engellemez.' : 'Kullanıcı adı değiştirilemedi. Mevcut adın korundu; sohbet aktarımın bundan etkilenmedi.'}</div>}
       {(inventory.destinations?.length ?? 0) > 0 && <div className="mt-6 divide-y rounded-lg border">{inventory.destinations?.map(destination => { const path = destinationPath(destination); return path && <Link key={`${destination.source_id}-${destination.channel_id ?? destination.guild_id}`} to={path} className="flex items-center gap-3 px-4 py-3 text-sm hover:bg-accent"><CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" /><span className="min-w-0 flex-1 truncate">{destination.name}</span><ArrowRight className="h-4 w-4 text-muted-foreground" /></Link> })}</div>}
