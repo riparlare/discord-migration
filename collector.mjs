@@ -66,12 +66,14 @@ export class DiscordCollector {
   #scanned;
   #channels = new Map();
   #lastProgress = { phase: 'discovery', messages: 0, media: 0 };
-  constructor(token, { transport = request, sleep = pause, progress = () => {} } = {}) {
+  #retainAfterCollect;
+  constructor(token, { transport = request, sleep = pause, progress = () => {}, retainAfterCollect = false } = {}) {
     if (typeof token !== 'string' || !token || token.length > 4096 || /\s/.test(token)) throw new Error('Invalid credential input');
     this.#token = token;
     this.#request = transport;
     this.#wait = sleep;
     this.progress = progress;
+    this.#retainAfterCollect = retainAfterCollect === true;
   }
   cancel() { this.#controller.abort(); this.#token = undefined; this.#scanned = undefined; }
   #report(event) {
@@ -302,7 +304,9 @@ export class DiscordCollector {
         const original = this.#snapshots.get(guildId);
         const roleIds = selection.role_ids?.[guildId];
         zip.add(`guilds/${guildId}.json`, JSON.stringify({ ...original,
-          channels: original.channels.filter((c) => included.has(c.id)),
+          // A channel may change between discovery and inspection. Serialize
+          // the same inspected snapshot used by its message envelopes.
+          channels: original.channels.filter((c) => included.has(c.id)).map(c => scanned.records.get(c.id)?.metadata ?? c),
           roles: selection.include_roles === false ? [] : original.roles.filter((r) => !roleIds || roleIds.includes(r.id)) }));
       }
       for (const channel of selected) {
@@ -356,7 +360,7 @@ export class DiscordCollector {
     } finally {
       // A bounded packing error must not discard the inspected history. The host
       // retains it only until idle expiry/cancel, allowing a smaller retry.
-      if (completed) this.cancel();
+      if (completed && !this.#retainAfterCollect) this.cancel();
       this.#active = false;
     }
   }

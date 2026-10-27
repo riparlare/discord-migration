@@ -229,6 +229,41 @@ describe('selective import UI', () => {
     expect(discordMigrationApi.upload).toHaveBeenCalledTimes(1)
   })
 
+  it.each([false, true])('keeps prepared bytes after upload failure and invalidates them on filter change=%s', async changeFilter => {
+    const scan = vi.fn().mockResolvedValue({ ...inventory, id: 'local-selection', status: 'local', source_hash: 'local' })
+    const collect = vi.fn().mockResolvedValue(new Uint8Array([80, 75, 3, 4]))
+    const disconnect = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(window, 'electronAPI', { configurable: true, value: { discordMigration: {
+      connect: vi.fn().mockResolvedValue({ guilds: inventory.guilds, channels: inventory.channels, warnings: [], account: inventory.account }),
+      scan, collect, disconnect, cancel: vi.fn().mockResolvedValue(undefined), onProgress: () => () => undefined,
+    } } })
+    vi.mocked(discordMigrationApi.upload).mockRejectedValueOnce({ isAxiosError: true, response: { status: 503, data: 'PRIVATE INTERNAL DETAIL' } })
+      .mockResolvedValueOnce(inventory)
+    const user = userEvent.setup()
+    renderWizard(); await connectDesktop(user)
+    await user.click(await screen.findByRole('checkbox', { name: 'genel aktarımını seç' }))
+    await user.click(screen.getByRole('button', { name: 'Seçili içeriği hazırla' }))
+    await screen.findByText(/Seçili geçmiş şu anda yalnızca cihazında/)
+    await user.click(screen.getByRole('button', { name: 'Seçimleri incele' }))
+    await screen.findByText(/Sunucu yüklemeyi tamamlayamadı/)
+    expect(screen.queryByText(/PRIVATE INTERNAL DETAIL/)).not.toBeInTheDocument()
+    expect(disconnect).not.toHaveBeenCalled()
+    if (changeFilter) {
+      await user.click(screen.getByRole('tab', { name: 'Kişiler' }))
+      await user.click(within(screen.getByText('Alpha').closest('label')!).getByRole('checkbox'))
+      await user.click(screen.getByRole('button', { name: 'Seçimleri incele' }))
+    } else await user.click(screen.getByRole('button', { name: 'Yüklemeyi yeniden dene' }))
+    await screen.findByRole('heading', { name: 'Seçtiklerin böyle gelecek' })
+    expect(scan).toHaveBeenCalledTimes(1)
+    expect(collect).toHaveBeenCalledTimes(changeFilter ? 2 : 1)
+    const [first, second] = vi.mocked(discordMigrationApi.upload).mock.calls
+    if (changeFilter) {
+      expect(first[0]).not.toBe(second[0])
+      expect(collect).toHaveBeenLastCalledWith(expect.objectContaining({ excluded_author_ids: ['400'] }))
+    } else expect(first[0]).toBe(second[0])
+    expect(disconnect).toHaveBeenCalledTimes(1)
+  })
+
   it.each(['committed', 'importing'])('opens the existing %s job after duplicate desktop upload without preview or another commit', async status => {
     const existing = { ...inventory, id: 'existing-job', status,
       progress: { stage: 'messages', completed: 2, total: 5 },

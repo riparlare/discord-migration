@@ -257,3 +257,27 @@ test('a bounded packing failure can retry from inspected history without re-read
     assert.equal(fixture.calls.length,calls);
   }finally{StoredZip.prototype.add=add;collector.cancel();}
 });
+
+test('guild and message envelopes use one inspected channel snapshot after permissions change',async()=>{
+ const initial={id:'22',guild_id:'44',type:0,name:'synthetic',permission_overwrites:[{id:'44',type:0,allow:'1024',deny:'0'}]};
+ const current={...initial,permission_overwrites:[{id:'44',type:0,allow:'3072',deny:'0'}]};
+ const fixture=source({'/guilds/44/channels':[initial],'/channels/22':current});
+ const collector=new DiscordCollector('secret',fixture.options);await collector.discover();await collector.inspectGuild('44');
+ const files=entries(await collector.collect({channel_ids:['22'],guild_ids:['44'],include_messages:true}));
+ const snapshot=JSON.parse(files.get('guilds/44.json')).channels[0];
+ assert.deepEqual(snapshot,JSON.parse(files.get('channels/22/metadata.json')).channel);
+ assert.deepEqual(snapshot,JSON.parse(files.get('channels/22/00000000.json')).channel);
+ assert.equal(snapshot.permission_overwrites[0].allow,'3072');
+});
+
+test('explicit host retry mode retains inspected rows after packing until release',async()=>{
+ const fixture=source();const collector=new DiscordCollector('secret',{...fixture.options,retainAfterCollect:true});
+ await collector.discover();await collector.inspectGuild('44');
+ const selection={channel_ids:['22'],guild_ids:['44'],include_voice_text:true};await collector.scan(selection);
+ const calls=fixture.calls.length;
+ await collector.collect(selection);
+ const second=entries(await collector.collect({...selection,excluded_author_ids:['33']}));
+ assert.equal(second.has('channels/22/00000000.json'),false);
+ assert.equal(fixture.calls.length,calls);
+ collector.cancel();await assert.rejects(collector.collect(selection),/cancelled/);
+});

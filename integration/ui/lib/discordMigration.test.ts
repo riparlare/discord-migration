@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('@/api/client', () => ({ axiosInstance: {} }))
 vi.mock('@/lib/connectionConfig', () => ({ getApiBaseUrl: () => 'https://riparlare.test/api/v1' }))
 
-import { canonicalSelection, channelSubtree, collectorErrorMessage, emptySelection, normalizeInventory, ownedImportMediaUrl, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type ImportInventory } from './discordMigration'
+import { canonicalSelection, channelSubtree, collectorErrorMessage, emptySelection, importUploadErrorMessage, rejectedImportSnapshot, normalizeInventory, ownedImportMediaUrl, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type ImportInventory } from './discordMigration'
 
 const inventory: ImportInventory = {
   id: 'job', status: 'ready', source_hash: 'hash', warnings: [],
@@ -19,6 +19,16 @@ const inventory: ImportInventory = {
 }
 
 describe('Discord import selection boundaries', () => {
+  it('distinguishes rejected snapshots from retryable uploads without leaking remote bodies', () => {
+    const failure = (status: number, data: unknown) => ({ isAxiosError: true, response: { status, data } })
+    expect(importUploadErrorMessage(failure(409, 'archive_source_conflict'))).toContain('kanal bilgileri')
+    expect(rejectedImportSnapshot(failure(409, 'archive_source_conflict'))).toBe(true)
+    expect(rejectedImportSnapshot(failure(503, 'PRIVATE'))).toBe(false)
+    expect(importUploadErrorMessage(failure(429, 'discord_import_busy_retry'))).toContain('Başka bir aktarım')
+    expect(importUploadErrorMessage(failure(500, 'PRIVATE TOKEN'))).not.toContain('PRIVATE')
+    expect(importUploadErrorMessage(new Error('PRIVATE TOKEN'))).toContain('Yükleme tamamlanamadı')
+    expect(importUploadErrorMessage(new Error('PRIVATE TOKEN'))).not.toContain('PRIVATE')
+  })
   it('does not silently select private or group histories on initial upload', () => {
     const selection = emptySelection(inventory)
     expect(selection.channel_ids).toEqual([])

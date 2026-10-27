@@ -122,6 +122,41 @@ const warningLabels: Record<string, string> = {
 }
 export function importWarningText(code: string): string { return warningLabels[code] ?? code }
 
+function importResponseCode(error: unknown): string | undefined {
+  if (!axios.isAxiosError(error)) return undefined
+  const data = error.response?.data
+  if (typeof data === 'string') return data.trim()
+  if (data && typeof data === 'object') {
+    const code = (data as Record<string, unknown>).error ?? (data as Record<string, unknown>).message
+    if (typeof code === 'string') return code.trim()
+  }
+}
+
+export function rejectedImportSnapshot(error: unknown): boolean {
+  return ['archive_source_conflict', 'archive_invalid_or_unsupported', 'archive_unsafe_path'].includes(importResponseCode(error) ?? '')
+}
+
+export function importUploadErrorMessage(error: unknown): string {
+  const messages: Record<string, string> = {
+    archive_source_conflict: 'Kaynak kanal bilgileri arşivde çakıştı. Seçimlerin korundu; arşivi yeniden hazırlayıp deneyebilirsin.',
+    archive_invalid_or_unsupported: 'Hazırlanan arşiv doğrulanamadı. Seçimlerin korundu; arşivi yeniden hazırlayıp deneyebilirsin.',
+    archive_unsafe_path: 'Arşivde desteklenmeyen bir dosya yolu var. Kaynak arşivi yeniden hazırla.',
+    archive_too_large: 'Arşiv 64 MB sınırını aşıyor. Daha az kanal veya ek seçerek yeniden hazırla.',
+    archive_limit_exceeded: 'Arşiv sunucunun dosya veya içerik sınırını aşıyor. Seçimini küçültüp yeniden hazırla.',
+    discord_import_busy_retry: 'Başka bir aktarım işleniyor. Hazırlanan arşiv korundu; birazdan yüklemeyi yeniden deneyebilirsin.',
+    import_retention_quota_reached: 'Hesabının aktarım saklama kotası dolu. Hazırlanan arşiv bu pencere açıkken korunuyor.',
+  }
+  const code = importResponseCode(error)
+  if (code && messages[code]) return messages[code]
+  const status = axios.isAxiosError(error) ? error.response?.status : undefined
+  if (status === 401) return 'Oturum doğrulanamadı. Hazırlanan arşiv korundu; oturumunu yenileyip yüklemeyi tekrar dene.'
+  if (status === 403) return 'Yükleme için erişim izni alınamadı. Hazırlanan arşiv bu pencere açıkken korunuyor.'
+  if (status === 413) return messages.archive_too_large
+  if (status === 429) return messages.discord_import_busy_retry
+  if (status && status >= 500) return 'Sunucu yüklemeyi tamamlayamadı. Hazırlanan arşiv korundu; yüklemeyi yeniden deneyebilirsin.'
+  return 'Yükleme tamamlanamadı. Hazırlanan arşiv bu pencere açıkken korundu; bağlantını kontrol edip yüklemeyi yeniden dene.'
+}
+
 const unique = (items: string[]) => [...new Set(items)].sort()
 export const isVoiceSource = (channel: SourceChannel) => channel.type === 2 || channel.type === 13
 export const isCategorySource = (channel: SourceChannel) => channel.type === 4

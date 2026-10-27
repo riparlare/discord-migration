@@ -77,7 +77,7 @@ export function registerDiscordMigration(getWindow: () => BrowserWindow | null) 
     disconnect();
     if (input?.acceptedRisk !== true || typeof input.token !== 'string') throw new Error('Accept the account risk before connecting');
     const activeGeneration = generation;
-    const current = new DiscordCollector(input.token, { progress: (progress) => {
+    const current = new DiscordCollector(input.token, { retainAfterCollect: true, progress: (progress) => {
       if (generation === activeGeneration && !event.sender.isDestroyed()) event.sender.send('discord-migration:progress', progress);
     } });
     input.token = undefined;
@@ -118,19 +118,18 @@ export function registerDiscordMigration(getWindow: () => BrowserWindow | null) 
     const activeGeneration = generation, current = collector;
     collecting = true;
     if (timer) clearTimeout(timer);
-    let completed = false;
     try {
       const bytes = await current.collect(selection);
       if (generation !== activeGeneration) throw new Error('Collection cancelled');
-      completed = true;
       return bytes;
     } catch (error) {
       if (error instanceof SourceError && error.status === 401 && generation === activeGeneration) disconnect();
       throw sourceFailure(error, 'İçerik alınamadı. Daha az kanal seçerek tekrar dene; erişilemeyen içerikler atlanır.');
     } finally {
       if (generation === activeGeneration) {
-        if (completed) disconnect();
-        else { collecting = false; timer = setTimeout(disconnect, 10 * 60 * 1000); }
+        // Renderer releases this source after upload acknowledgement. A failed
+        // upload can reuse/re-filter inspected data until idle expiry/cancel.
+        collecting = false; timer = setTimeout(disconnect, 10 * 60 * 1000);
       }
     }
   });

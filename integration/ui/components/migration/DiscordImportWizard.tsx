@@ -7,7 +7,7 @@ import { apiErrorMessage } from '@/lib/apiError'
 import { queryClient } from '@/lib/queryClient'
 import { useAuthStore } from '@/stores/authStore'
 import type { DtoUser } from '@/types'
-import { canonicalSelection, collectorErrorMessage, destinationPath, discordMigrationApi, emptySelection, importWarningText, normalizeInventory, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type DiscordSourceAccount, type ImportInventory, type ImportPreview, type ImportSelection, type SourceChannel, type SourceGuild, type UsernameAdoption } from '@/lib/discordMigration'
+import { canonicalSelection, collectorErrorMessage, destinationPath, discordMigrationApi, emptySelection, importWarningText, importUploadErrorMessage, rejectedImportSnapshot, normalizeInventory, selectionDateError, selectionFingerprint, selectionLimitError, toggleChannels, type DiscordSourceAccount, type ImportInventory, type ImportPreview, type ImportSelection, type SourceChannel, type SourceGuild, type UsernameAdoption } from '@/lib/discordMigration'
 import SourceTree from './SourceTree'
 import ImportOptions from './ImportOptions'
 
@@ -62,6 +62,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   const [busy, setBusy] = useState<'upload' | 'connect' | 'inspect' | 'scan' | 'collect' | 'preview' | 'commit' | 'resume' | null>(null)
   const [loadingGuildId, setLoadingGuildId] = useState<string | null>(null)
   const [uploadProgress, setUploadProgress] = useState(0)
+  const [preparedUpload, setPreparedUpload] = useState<{ file: File; fingerprint: string } | null>(null)
   const [collectorProgress, setCollectorProgress] = useState<CollectorProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [confirmed, setConfirmed] = useState(false)
@@ -114,6 +115,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   useEffect(() => { setConfirmed(false) }, [currentFingerprint])
 
   function changeSelection(value: ImportSelection | ((previous: ImportSelection) => ImportSelection)) {
+    setPreparedUpload(null)
     selectionRevision.current++
     setSelection(previous => previous ? typeof value === 'function' ? value(previous) : value : previous)
     setError(null)
@@ -122,6 +124,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     setUsernameResult(null)
   }
   function useInventory(data: ImportInventory, previous?: ImportSelection) {
+    setPreparedUpload(null)
     setInventory(data)
     setSelection(previous ? canonicalSelection({ ...emptySelection(data), ...previous }, data) : data.selection ?? emptySelection(data))
     setFocusedId(data.channels[0]?.id ?? null)
@@ -142,12 +145,15 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     const controller = new AbortController()
     uploadController.current = controller
     setBusy('upload'); setError(null); setUploadProgress(0)
+    let accepted = false
     try {
       const uploaded = await discordMigrationApi.upload(file, controller.signal, percent => { if (serial === requestSerial.current) setUploadProgress(percent) })
+      accepted = true
       // Local scan failures can be absent from normalized server inventory. Keep
       // those explicit caveats when replacing local inventory with its ZIP job.
       const data = retainSourceWarnings(uploaded, previewAfterUpload ? inventory?.warnings : [])
       if (mounted.current && serial === requestSerial.current) {
+        if (previewAfterUpload) void bridge?.disconnect().catch(() => undefined)
         useInventory(data, previous)
         // An idempotent upload can return the existing committed/running job.
         // Keep its destination/progress screen; never restart preview or commit.
@@ -165,7 +171,10 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
         }
       }
     } catch (failure) {
-      if (mounted.current && !controller.signal.aborted && serial === requestSerial.current) setError(apiErrorMessage(failure, t, 'Arşiv okunamadı. Dosyanın geçerli bir Discord aktarım arşivi olduğunu kontrol et.'))
+      if (mounted.current && !controller.signal.aborted && serial === requestSerial.current) {
+        if (!accepted && rejectedImportSnapshot(failure)) setPreparedUpload(null)
+        setError(accepted ? apiErrorMessage(failure, t, 'Önizleme hazırlanamadı. Arşivin sunucuda kayıtlı; seçimini yeniden inceleyebilirsin.') : previewAfterUpload ? importUploadErrorMessage(failure) : apiErrorMessage(failure, t, 'Arşiv yüklenemedi. ZIP dosyanı yeniden seçerek tekrar deneyebilirsin.'))
+      }
     } finally {
       if (mounted.current && serial === requestSerial.current) setBusy(null)
       if (uploadController.current === controller) uploadController.current = null
@@ -204,12 +213,18 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     const serial = ++requestSerial.current
     setBusy('collect'); setError(null); setCollectorProgress(null)
     try {
+      if (preparedUpload?.fingerprint === currentFingerprint) {
+        await upload(preparedUpload.file, canonical, true)
+        return
+      }
       const data = await bridge.collect(canonical)
       if (!mounted.current || serial !== requestSerial.current) return
       // Copy the bridge bytes into an owned ArrayBuffer, avoiding SharedArrayBuffer/File typing issues.
       const buffer = new ArrayBuffer(data.byteLength)
       new Uint8Array(buffer).set(data)
-      await upload(new File([buffer], 'discord-aktarim.zip', { type: 'application/zip' }), canonical, true)
+      const file = new File([buffer], 'discord-aktarim.zip', { type: 'application/zip' })
+      setPreparedUpload({ file, fingerprint: currentFingerprint })
+      await upload(file, canonical, true)
     } catch (failure) {
       if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Seçili içerik hazırlanamadı; seçimlerin korundu. Daha az kanal veya ek seçip yeniden deneyebilirsin. Kaynak bağlantısı kesildiyse kaynağı değiştirip yeniden bağlan.'))
     } finally { if (mounted.current && serial === requestSerial.current) setBusy(null) }
@@ -374,6 +389,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     finally { if (mounted.current) setBusy(null) }
   }
   async function cancelSource() {
+    setPreparedUpload(null)
     uploadController.current?.abort()
     requestSerial.current++
     await bridge?.cancel().catch(() => undefined)
@@ -413,7 +429,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
         {sourceMode === 'archive' ? <section className="rounded-xl border border-dashed p-7 sm:p-9">
           <FileArchive className="h-9 w-9 text-muted-foreground" /><h3 className="mt-4 text-lg font-semibold">Aktarım arşivini seç</h3><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Riparlare aktarım aracının oluşturduğu ZIP arşivi veya Discord veri paketi. Discord’un kendi paketi yalnızca senin gönderdiğin mesajları içerebilir.</p><p className="mt-2 text-xs text-muted-foreground">En fazla 64 MB. Seçim yapmadan hiçbir sunucu oluşturulmaz.</p>
           <input ref={fileInput} type="file" accept=".zip,application/zip" className="hidden" aria-label="Discord ZIP arşivi seç" onChange={event => { const file = event.target.files?.[0]; if (file) void upload(file); event.target.value = '' }} />
-          <button type="button" disabled={!!busy} onClick={() => fileInput.current?.click()} className="mt-6 inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-50">{busy === 'upload' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}{busy === 'upload' ? `Arşiv okunuyor · %${uploadProgress}` : 'ZIP arşivi seç'}</button>
+          <button type="button" disabled={!!busy} onClick={() => fileInput.current?.click()} className="mt-6 inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-50">{busy === 'upload' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}{busy === 'upload' ? (uploadProgress >= 100 ? 'Arşiv sunucuda doğrulanıyor…' : `Arşiv gönderiliyor · %${uploadProgress}`) : 'ZIP arşivi seç'}</button>
         </section> : <section className="space-y-4">
           {!bridge ? <div className="rounded-lg border p-5"><h3 className="font-semibold">Masaüstü uygulamasında kullanılabilir</h3><p className="mt-2 text-sm leading-relaxed text-muted-foreground">Discord bağlantısı cihazında çalışır. Güncel Windows uygulamasını açabilir veya hazırladığın ZIP arşivini bu ekrandan seçebilirsin.</p><Link to="/indir" className="mt-4 inline-block text-sm underline underline-offset-4">Masaüstü uygulamasını indir</Link></div> : <>
             <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 text-sm leading-relaxed"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" /><p>Discord, kullanıcı hesabıyla otomatik veri okumayı yasaklıyor ve hesabına yaptırım uygulayabilir. Bu riski kabul etmek Discord kurallarını değiştirmez. Yalnızca kendi hesabınla erişebildiğin içeriği seç.</p></div>
@@ -450,7 +466,7 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
       <button type="button" disabled={!!busy} onClick={() => void resume(inventory.id)} className="mt-5 block text-sm text-muted-foreground underline underline-offset-4">Durumu yenile</button>
     </div></main>}
 
-    {busy && busy !== 'commit' && <div role="status" aria-live="polite" className="flex shrink-0 items-center gap-3 border-t bg-popover px-5 py-3 text-sm sm:px-8"><Loader2 className="h-4 w-4 shrink-0 animate-spin" /><span className="flex-1">{busy === 'inspect' || busy === 'connect' ? discoveryProgress : (busy === 'collect' || busy === 'scan') && collectorProgress ? `${phaseLabels[collectorProgress.phase]} · ${collectorProgress.messages} mesaj · ${collectorProgress.media} ek${waitingText}` : busy === 'scan' ? 'Geçmiş yalnızca cihazında inceleniyor…' : busy === 'upload' ? `Arşiv okunuyor · %${uploadProgress}` : busy === 'preview' ? 'Seçimlerin hesaplanıyor…' : 'Aktarım açılıyor…'}</span>{(busy === 'collect' || busy === 'scan' || busy === 'upload' || busy === 'connect' || busy === 'inspect') && <button type="button" onClick={() => void cancelSource()} className="underline underline-offset-4">Durdur</button>}</div>}
-    {step > 0 && step < 3 && <footer className="flex shrink-0 items-center justify-between gap-3 border-t bg-sidebar px-5 py-4 sm:px-8"><button type="button" disabled={working} onClick={() => step === 1 ? void resetSource() : setStep(1)} className="inline-flex items-center gap-2 rounded-md px-2 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-40"><ArrowLeft className="h-4 w-4" />{step === 1 ? 'Kaynak değiştir' : 'Seçime dön'}</button><div className="flex min-w-0 flex-col items-end gap-1">{dateError || limitError ? <span className="max-w-sm text-right text-xs text-destructive">{dateError || limitError}</span> : unloadedSelectedGuild && <span className="text-xs text-muted-foreground">Seçili sunucunun kanalları yüklenmeli.</span>}<button type="button" disabled={working || unloadedSelectedGuild || !!limitError || (step === 1 && (!canonical || (!selectedCount && !canonical.guild_ids.length) || !!dateError)) || (step === 2 && (!validPreview || !confirmed))} onClick={() => void (step === 1 ? desktopSource ? desktopScanned ? collect() : scan() : makePreview() : commit())} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{step === 1 ? desktopSource && !desktopScanned ? 'Seçili içeriği hazırla' : 'Seçimleri incele' : 'Riparlare’ye aktar'}{!busy && <ArrowRight className="h-4 w-4" />}</button></div></footer>}
+    {busy && busy !== 'commit' && <div role="status" aria-live="polite" className="flex shrink-0 items-center gap-3 border-t bg-popover px-5 py-3 text-sm sm:px-8"><Loader2 className="h-4 w-4 shrink-0 animate-spin" /><span className="flex-1">{busy === 'inspect' || busy === 'connect' ? discoveryProgress : (busy === 'collect' || busy === 'scan') && collectorProgress ? `${phaseLabels[collectorProgress.phase]} · ${collectorProgress.messages} mesaj · ${collectorProgress.media} ek${waitingText}` : busy === 'scan' ? 'Geçmiş yalnızca cihazında inceleniyor…' : busy === 'upload' ? (uploadProgress >= 100 ? 'Arşiv sunucuda doğrulanıyor…' : `Arşiv gönderiliyor · %${uploadProgress}`) : busy === 'preview' ? 'Seçimlerin hesaplanıyor…' : 'Aktarım açılıyor…'}</span>{(busy === 'collect' || busy === 'scan' || busy === 'upload' || busy === 'connect' || busy === 'inspect') && <button type="button" onClick={() => void cancelSource()} className="underline underline-offset-4">Durdur</button>}</div>}
+    {step > 0 && step < 3 && <footer className="flex shrink-0 items-center justify-between gap-3 border-t bg-sidebar px-5 py-4 sm:px-8"><button type="button" disabled={working} onClick={() => step === 1 ? void resetSource() : setStep(1)} className="inline-flex items-center gap-2 rounded-md px-2 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-40"><ArrowLeft className="h-4 w-4" />{step === 1 ? 'Kaynak değiştir' : 'Seçime dön'}</button><div className="flex min-w-0 flex-col items-end gap-1">{dateError || limitError ? <span className="max-w-sm text-right text-xs text-destructive">{dateError || limitError}</span> : unloadedSelectedGuild && <span className="text-xs text-muted-foreground">Seçili sunucunun kanalları yüklenmeli.</span>}<button type="button" disabled={working || unloadedSelectedGuild || !!limitError || (step === 1 && (!canonical || (!selectedCount && !canonical.guild_ids.length) || !!dateError)) || (step === 2 && (!validPreview || !confirmed))} onClick={() => void (step === 1 ? desktopSource ? desktopScanned ? collect() : scan() : makePreview() : commit())} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{step === 1 ? desktopSource && !desktopScanned ? 'Seçili içeriği hazırla' : preparedUpload?.fingerprint === currentFingerprint ? 'Yüklemeyi yeniden dene' : 'Seçimleri incele' : 'Riparlare’ye aktar'}{!busy && <ArrowRight className="h-4 w-4" />}</button></div></footer>}
   </div>
 }
