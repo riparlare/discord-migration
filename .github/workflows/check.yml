@@ -15,3 +15,15 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m unittest -v
       - run: python -m py_compile discord_export.py
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test collector.test.mjs
+      - run: node --check collector.mjs

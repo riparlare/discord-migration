@@ -1,10 +1,15 @@
 # Riparlare Discord migration
 
-An independent, open-source **preview** exporter for moving your own accessible Discord histories toward Riparlare. Python 3.11+, standard library only. No Discord client modification, token extraction, gateway connection, analytics, or Riparlare credential endpoint.
+Independent, open-source **preview** collection tools for moving your own accessible Discord histories toward Riparlare:
 
-**User-account automation violates Discord's published policy and can lead to account termination.** Each run requires an interactive risk acceptance before prompting for a credential or making requests. Acceptance does not change Discord's rules, guarantee safety, or grant permission over other people's content. [Discord policy](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots).
+- `discord_export.py`: Python 3.11+ standalone exporter, standard library only.
+- `collector.mjs`: Node.js 22+ collection library, built-in modules only, for a host application's selective import flow. It is not a command-line login program or the Riparlare application/backend.
 
-## Current capabilities
+Neither tool modifies the Discord client, extracts installed-client credentials, opens a gateway connection, bypasses permissions or sends analytics. History collection keeps your Discord credential on your device. A host may offer a **separate, default-off identity verification choice** that sends it once to Riparlare; that exception requires its own explicit consent, described below.
+
+**User-account automation violates Discord's published policy and can lead to account termination.** The Python CLI requires interactive risk acceptance before prompting for a credential or making requests. A Node host must provide equivalent disclosure and consent before constructing the collector; the library does not display its own prompt. Acceptance does not change Discord's rules, guarantee safety, or grant permission to publish other people's content. [Discord policy](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots).
+
+## Python CLI capabilities
 
 - Select channels, a guild, or best-effort discoverable histories including available DMs/group DMs.
 - Export all authors returned by the source, original message IDs/timestamps/content/replies and attachment metadata.
@@ -13,13 +18,13 @@ An independent, open-source **preview** exporter for moving your own accessible 
 - Resume backwards pagination using transactional local SQLite checkpoints, with account binding and idempotent pages. Short responses are followed until an empty page; authentication failures stop. Permission failures are reported, not bypassed.
 - Export channel-page JSON envelopes in a ZIP, keeping IDs as strings, and a completeness/failure manifest.
 
-**Not implemented yet:** importing this archive into the live Riparlare app, creating target guilds/roles/channels, verified identity claiming, a graphical interface, archived-thread discovery, closed-DM discovery, membership/role restoration, and complete reaction/voter histories. Raw message fields such as embeds and reactions are preserved when returned; normalization may not support all of them. This tool does not claim to copy every channel, deleted message, expired attachment, or inaccessible content.
+The CLI exports ZIP files; it does not import them into Riparlare, create destination guilds/roles/channels, link accounts or supply a graphical interface. The Node library's intended host flow is described below; those host/backend functions are not included in this public repository, and this README does not establish their production deployment status. Neither collector guarantees archived-thread or closed-DM discovery, membership/role restoration, complete reaction/voter histories, deleted messages, expired attachments or inaccessible content. The CLI preserves raw message fields returned by Discord; downstream normalization may support fewer fields.
 
 Guild snapshots are data, not ownership proofs. Original role/channel/user IDs require mapping to new target IDs before restoration. Source bot-managed roles cannot simply become managed target roles. Source ownership, target authorization and member-specific overwrites need independent verification; never assign an imported author's privileges to an unrelated target account. Permissions may change during capture. Messages edited/deleted during backwards pagination and newer messages after the first page are not an atomic snapshot. Completed histories are not automatically refreshed; use a new output directory for a fresh snapshot.
 
 An empty history response proves only pagination exhaustion: Discord may also return no messages when history permission is missing. The manifest explicitly marks history access as unverified. A zero-error run is not proof that every source message was copied. [Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages).
 
-## Run
+## Run the Python CLI
 
 Download the source from this repository. From its folder:
 
@@ -56,11 +61,43 @@ Treat **all output as private**, including signed media URLs. ZIP/SQLite are not
 
 Backend archive readers may impose smaller ZIP/file/message limits than this exporter. Split large source selections into separate output directories or explicitly configure appropriate bounded import limits. A ZIP can contain many pages/media and is not guaranteed to fit the default backend preview limits.
 
+## Node collector and intended integrated flow
+
+`collector.mjs` exports `DiscordCollector`, with `discover()`, `scan(selection)`, `collect(selection)` and `cancel()`. No npm install, application secrets or Discord OAuth application registration is required to use the collection library. Running `node collector.mjs` alone does not open a UI or collect data. The host is responsible for private credential input, risk disclosure, cancellation, progress display and any later upload/import action. Do not supply credentials through command arguments, environment variables, files or public examples.
+
+The intended Riparlare desktop flow uses a narrow main-process bridge:
+
+1. The user enters their own credential and accepts the account risk. The renderer clears its input; the main process holds the credential transiently and discovers source metadata through fixed Discord HTTPS GET endpoints.
+2. The user selects guilds, categories/channels, voice/stage text, DMs/groups and content choices. `scan(selection)` reads selected histories into bounded device memory and returns author/count inventory. It does **not** upload content or download attachments. With `include_messages:false`, it requests no message histories.
+3. The user inspects the local inventory and adjusts global/per-channel author exclusions, dates, message/media types and role choices. `collect(selection)` reuses the scanned rows and filters messages **before** downloading retained attachments or writing ZIP entries. It omits nested quoted-message payloads that could otherwise carry excluded content. Empty selected conversations retain metadata envelopes. Expanding to histories that were not scanned requires another source inspection.
+4. Only the filtered ZIP is handed back to the host for upload. The server independently validates and previews the selection before an explicit commit creates destinations. No native destination or account membership is created by this library itself.
+
+Node collection limits are **64 MiB per ZIP**, **100,000 scanned messages**, 32 MiB of cached message JSON, 8 MiB per API response and at most 4095 ZIP entries. Attachment attempts allow 16 MiB per file and a 32 MiB download budget per collection; failed attempts consume the budget too. Histories are capped at 1000 pages of at most 100 messages per channel. These differ from the Python CLI's file/download limits. A smaller limit may be reached before the message cap, and backend acceptance is separately bounded. Divide large selections into smaller imports.
+
+Node scan state is memory-only, without the Python CLI's persistent SQLite resume. Cancellation or final collection drops the collector's credential/cache references; a new attempt requires reconnecting. Language/runtime buffers do not guarantee physical secure erasure. The Node library makes fixed-origin read requests, follows no redirects and fetches approved Discord CDN attachment URLs without Authorization. Permissions and 429 delays are respected; account challenges are not bypassed.
+
+## Optional identity linking and native username
+
+History collection and identity verification are distinct permissions. Collection does not send the Discord token to Riparlare. In the intended integrated UI, the separately unchecked **“Link my Discord account”** choice explicitly authorizes a one-time transfer to Riparlare's fixed HTTPS verification endpoint. The main bridge then uses a current Riparlare session and the expected discovered Discord ID; it returns safe link metadata, never the Discord credential, to the renderer. The server verifies the actual immutable ID against Discord and does not save the token. The collection library's `verifyWith(callback)` is only a hook for a trusted host implementing that separate flow; it does not enforce a host's consent UI or choose a verification destination itself.
+
+Discord and Riparlare usernames **do not need to match**. Identity linking uses the verified Discord ID, not names. A separate optional native username change may be offered; a taken or invalid name keeps the existing name and must not prevent the import. An uploaded archive, account label or username change never proves identity or source guild ownership.
+
+In the intended importer, copied historical messages/media remain visible only to the original uploader, subject also to their current destination access. Adding native group/server members or verifying an author's Discord identity does not automatically give those people the retained history. New native group conversations and their membership are separate from imported counterparts; no absent author receives a fabricated login or automatic role. Copied guild/role metadata does not transfer the original server's ownership. Source everyone permissions and unsupported capabilities require review before sharing; a private copy is not a guarantee of identical effective permissions.
+
 ## Trust and verification
 
-An exported source author is unclaimed metadata. Uploading a JSON archive, controlling this tool, or supplying a source ID does not prove that author wrote the submitted text or owns a Riparlare account. Future account linking must verify the immutable Discord subject independently. Linking must not grant access to another person's private archives or transfer a source guild's ownership.
+An exported source author is unclaimed metadata. Uploading a JSON archive, controlling this tool, or supplying a source ID does not prove that author wrote the submitted text or owns a Riparlare account. Account linking must verify the immutable Discord ID independently. Even verified ID control does not authenticate text inside an editable archive. Linking must not grant access to another person's private archives or transfer a source guild's ownership.
 
-Tests use synthetic accounts, fake transports, temporary databases and tiny media fixtures. They cover token routing, rate limits, resume after failures, ordering/cursor validation, source account binding, permission precision, CDN restrictions and file bounds. No real account import or live Riparlare integration has been verified. See [verification](VERIFICATION.md).
+Tests use synthetic accounts, fake transports, temporary databases and tiny media fixtures. Python tests cover token routing, rate limits, checkpoints, source account binding, permission precision, CDN restrictions and file bounds. Node tests cover the collection/ZIP contract, local inspection, content exclusions before media fetch/upload, structure-only choices, limits and cancellation. Run them on an authorized test runner:
+
+```console
+python -m unittest -v
+python -m py_compile discord_export.py
+node --test collector.test.mjs
+node --check collector.mjs
+```
+
+CI is configured to run the dependency-free suites on Python 3.11/3.13 and Node 22/24. Fake-transport results do not prove live endpoint compatibility, full source coverage or account safety. See [verification](VERIFICATION.md) for the scope/date of recorded results; it is not a live deployment certificate.
 
 Report software problems without credentials, database files, real archives, signed URLs or private messages. See [SECURITY.md](SECURITY.md).
 
