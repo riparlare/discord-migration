@@ -2,9 +2,11 @@ import type { ImportInventory, ImportSelection, SourceChannel, SourceGuild, Disc
 
 /** Feature-only contract; merge this property into the host's existing Electron API. */
 export interface DiscordMigrationBridge {
-  connect(input: { token: string; acceptedRisk: true }): Promise<{
+  connect(input: { token?: string; useSaved?: true; remember?: boolean; riparlare_access_token?: string; riparlare_api_base_url?: string; acceptedRisk: true }): Promise<{
     guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount
   }>
+  savedCredentialStatus?(input: { riparlare_access_token: string; riparlare_api_base_url?: string }): Promise<{ available: boolean; remembered: boolean; account?: DiscordSourceAccount }>
+  forgetSavedCredential?(input: { riparlare_access_token: string; riparlare_api_base_url?: string }): Promise<void>
   inspectGuild?(guildId: string): ReturnType<DiscordMigrationBridge['connect']>
   scan(selection: ImportSelection): Promise<ImportInventory>
   collect(selection: ImportSelection): Promise<Uint8Array>

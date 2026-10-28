@@ -16,6 +16,7 @@ vi.mock('@/lib/discordMigration', async importOriginal => {
 import { discordMigrationApi, type ImportInventory, type SourceChannel } from '@/lib/discordMigration'
 import DiscordImportWizard from './DiscordImportWizard'
 import ImportedHistory from './ImportedHistory'
+import { useAuthStore } from '@/stores/authStore'
 
 const inventory: ImportInventory = {
   id: 'job-1', status: 'ready', source_hash: 'source-hash', warnings: [],
@@ -57,12 +58,84 @@ async function connectDesktop(user: ReturnType<typeof userEvent.setup>) {
 describe('selective import UI', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    useAuthStore.setState({ token: null })
     Object.defineProperty(window, 'electronAPI', { configurable: true, value: undefined })
     vi.mocked(discordMigrationApi.list).mockResolvedValue([])
     vi.mocked(discordMigrationApi.upload).mockResolvedValue(inventory)
     vi.mocked(discordMigrationApi.preview).mockResolvedValue({ selection_hash: 'server-preview', counts: { channels: 1, messages: 2, media: 0, excluded_messages: 3 }, warnings: [] })
     vi.mocked(discordMigrationApi.commit).mockResolvedValue({ ...inventory, status: 'committed', destinations: [{ source_id: '300', name: 'genel', guild_id: '500', channel_id: '600' }] })
     vi.mocked(discordMigrationApi.adoptUsername).mockResolvedValue('updated')
+  })
+
+  it('resumes an encrypted saved credential only after explicit risk consent and never receives the source token', async () => {
+    useAuthStore.setState({ token: 'synthetic-native-auth' })
+    const status = vi.fn().mockResolvedValue({ available: true, remembered: true, account: inventory.account })
+    const connect = vi.fn().mockResolvedValue({ guilds: inventory.guilds, channels: inventory.channels, warnings: [] })
+    Object.defineProperty(window, 'electronAPI', { configurable: true, value: { discordMigration: { savedCredentialStatus: status, connect, disconnect: vi.fn().mockResolvedValue(undefined), onProgress: vi.fn(() => () => {}) } } })
+    const user = userEvent.setup()
+    renderWizard()
+    await user.click(screen.getByRole('tab', { name: 'Discord’dan seç' }))
+    const resume = await screen.findByRole('button', { name: 'Hatırlanan hesapla devam et' })
+    expect(resume).toBeDisabled()
+    expect(connect).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText('Discord hesap tokeni')).not.toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /Bu cihazda hatırla/ })).toBeChecked()
+    await user.click(screen.getByRole('checkbox', { name: /Kendi hesabımı kullanıyorum/ }))
+    await user.click(resume)
+    await screen.findByRole('checkbox', { name: 'genel aktarımını seç' })
+    expect(connect).toHaveBeenCalledWith({ useSaved: true, acceptedRisk: true, riparlare_access_token: 'synthetic-native-auth', riparlare_api_base_url: 'https://riparlare.test/api/v1' })
+    expect(status).toHaveBeenCalledWith({ riparlare_access_token: 'synthetic-native-auth', riparlare_api_base_url: 'https://riparlare.test/api/v1' })
+  })
+
+  it('remembers a manual credential only after the separate device checkbox is selected', async () => {
+    useAuthStore.setState({ token: 'synthetic-native-auth' })
+    const connect = vi.fn().mockResolvedValue({ guilds: inventory.guilds, channels: inventory.channels, warnings: [] })
+    Object.defineProperty(window, 'electronAPI', { configurable: true, value: { discordMigration: { savedCredentialStatus: vi.fn().mockResolvedValue({ available: true, remembered: false }), connect, disconnect: vi.fn().mockResolvedValue(undefined), onProgress: vi.fn(() => () => {}) } } })
+    const user = userEvent.setup()
+    renderWizard()
+    await user.click(screen.getByRole('tab', { name: 'Discord’dan seç' }))
+    const remember = screen.getByRole('checkbox', { name: /Bu cihazda hatırla/ })
+    await waitFor(() => expect(remember).not.toBeDisabled())
+    expect(remember).not.toBeChecked()
+    await user.click(remember)
+    await user.click(screen.getByRole('checkbox', { name: /Kendi hesabımı kullanıyorum/ }))
+    await user.type(screen.getByLabelText('Discord hesap tokeni'), 'synthetic-source-token')
+    await user.click(screen.getByRole('button', { name: 'Bağlan ve kaynakları göster' }))
+    await screen.findByRole('checkbox', { name: 'genel aktarımını seç' })
+    expect(connect).toHaveBeenCalledWith({ token: 'synthetic-source-token', acceptedRisk: true, remember: true, riparlare_access_token: 'synthetic-native-auth', riparlare_api_base_url: 'https://riparlare.test/api/v1' })
+  })
+
+  it('forgets a saved credential without automatically reconnecting', async () => {
+    useAuthStore.setState({ token: 'synthetic-native-auth' })
+    const forget = vi.fn().mockResolvedValue(undefined)
+    const connect = vi.fn()
+    Object.defineProperty(window, 'electronAPI', { configurable: true, value: { discordMigration: { savedCredentialStatus: vi.fn().mockResolvedValue({ available: true, remembered: true, account: inventory.account }), forgetSavedCredential: forget, connect, disconnect: vi.fn().mockResolvedValue(undefined), onProgress: vi.fn(() => () => {}) } } })
+    const user = userEvent.setup()
+    renderWizard()
+    await user.click(screen.getByRole('tab', { name: 'Discord’dan seç' }))
+    await user.click(await screen.findByRole('button', { name: 'Bu cihazdan unut' }))
+    await screen.findByLabelText('Discord hesap tokeni')
+    expect(forget).toHaveBeenCalledWith({ riparlare_access_token: 'synthetic-native-auth', riparlare_api_base_url: 'https://riparlare.test/api/v1' })
+    expect(screen.getByRole('checkbox', { name: /Bu cihazda hatırla/ })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: /Bu cihazda hatırla/ })).not.toBeDisabled()
+    expect(connect).not.toHaveBeenCalled()
+  })
+
+  it('disables remembering when OS encryption is unavailable and keeps manual collection usable', async () => {
+    useAuthStore.setState({ token: 'synthetic-native-auth' })
+    const connect = vi.fn().mockRejectedValue(new Error('SOURCE_AUTH_FAILED'))
+    Object.defineProperty(window, 'electronAPI', { configurable: true, value: { discordMigration: { savedCredentialStatus: vi.fn().mockResolvedValue({ available: false, remembered: false }), connect, disconnect: vi.fn().mockResolvedValue(undefined), onProgress: vi.fn(() => () => {}) } } })
+    const user = userEvent.setup()
+    renderWizard()
+    await user.click(screen.getByRole('tab', { name: 'Discord’dan seç' }))
+    await screen.findByText(/Bu cihazda güvenli saklama kullanılamıyor/)
+    expect(screen.getByRole('checkbox', { name: /Bu cihazda hatırla/ })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: /Kendi hesabımı kullanıyorum/ }))
+    await user.type(screen.getByLabelText('Discord hesap tokeni'), 'synthetic-source-token')
+    await user.click(screen.getByRole('button', { name: 'Bağlan ve kaynakları göster' }))
+    await screen.findByText(/Discord bağlantısının süresi dolmuş/)
+    expect(connect).toHaveBeenCalledWith({ token: 'synthetic-source-token', acceptedRisk: true, remember: false, riparlare_access_token: 'synthetic-native-auth', riparlare_api_base_url: 'https://riparlare.test/api/v1' })
+    expect(screen.getByLabelText('Discord hesap tokeni')).toHaveValue('')
   })
 
   it('retries native projection of an existing job without source collection or import recommit', async () => {

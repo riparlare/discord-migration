@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, FileArchive, FolderInput, Loader2, RefreshCw, ShieldCheck, Upload, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { apiErrorMessage } from '@/lib/apiError'
+import { getApiBaseUrl } from '@/lib/connectionConfig'
 import { queryClient } from '@/lib/queryClient'
 import { useAuthStore } from '@/stores/authStore'
 import { useMessageStore } from '@/stores/messageStore'
@@ -17,7 +18,9 @@ interface CollectorProgress {
   guild_id?: string; guild_name?: string; guilds_discovered?: number; waiting_ms?: number
 }
 interface DesktopMigrationBridge {
-  connect: (input: { token: string; acceptedRisk: true }) => Promise<{ guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount }>
+  connect: (input: { token?: string; useSaved?: true; remember?: boolean; riparlare_access_token?: string; riparlare_api_base_url?: string; acceptedRisk: true }) => Promise<{ guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount }>
+  savedCredentialStatus?: (input: { riparlare_access_token: string; riparlare_api_base_url?: string }) => Promise<{ available: boolean; remembered: boolean; account?: DiscordSourceAccount }>
+  forgetSavedCredential?: (input: { riparlare_access_token: string; riparlare_api_base_url?: string }) => Promise<void>
   inspectGuild?: (guildId: string) => Promise<{ guilds: SourceGuild[]; channels: SourceChannel[]; warnings: string[]; account?: DiscordSourceAccount }>
   scan: (selection: ImportSelection) => Promise<ImportInventory>
   collect: (selection: ImportSelection) => Promise<Uint8Array>
@@ -55,6 +58,10 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   const [desktopSource, setDesktopSource] = useState(false)
   const [desktopScanned, setDesktopScanned] = useState(false)
   const [token, setToken] = useState('')
+  const [savedCredential, setSavedCredential] = useState<{ available: boolean; remembered: boolean; account?: DiscordSourceAccount } | null>(null)
+  const [useSavedCredential, setUseSavedCredential] = useState(false)
+  const [rememberCredential, setRememberCredential] = useState(false)
+  const nativeAccessToken = useAuthStore(state => state.token)
   const [acceptedRisk, setAcceptedRisk] = useState(false)
   const [serverVerificationConsent, setServerVerificationConsent] = useState(false)
   const [linkResult, setLinkResult] = useState<{ discordId: string; status: 'verified' | 'failed' } | null>(null)
@@ -98,6 +105,28 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
   }, [])
 
   useEffect(() => bridge?.onProgress(progress => { if (mounted.current) setCollectorProgress(progress) }), [bridge])
+
+  useEffect(() => {
+    let active = true
+    setSavedCredential(null); setUseSavedCredential(false); setRememberCredential(false)
+    if (bridge?.savedCredentialStatus && nativeAccessToken) {
+      bridge.savedCredentialStatus({ riparlare_access_token: nativeAccessToken, riparlare_api_base_url: getApiBaseUrl() }).then(status => {
+        if (!active) return
+        setSavedCredential(status); setUseSavedCredential(status.available && status.remembered); setRememberCredential(status.available && status.remembered)
+      }).catch(() => { if (active) setSavedCredential({ available: false, remembered: false }) })
+    }
+    return () => { active = false }
+  }, [bridge, nativeAccessToken])
+
+  async function forgetCredential() {
+    if (!bridge?.forgetSavedCredential || !nativeAccessToken || busy) return
+    setBusy('resume')
+    try {
+      await bridge.forgetSavedCredential({ riparlare_access_token: nativeAccessToken, riparlare_api_base_url: getApiBaseUrl() })
+      if (mounted.current) { setSavedCredential(previous => previous ? { ...previous, remembered: false, account: undefined } : previous); setUseSavedCredential(false); setRememberCredential(false); setToken('') }
+    } catch { if (mounted.current) setError('Bu cihazdaki kayıt silinemedi. Yeniden dene; kimlik bilgisini hata raporuna ekleme.') }
+    finally { if (mounted.current) setBusy(null) }
+  }
 
   useEffect(() => {
     if (!inventory || (!activeStatus(inventory.status) && !['pending', 'projecting'].includes(inventory.native_projection?.state ?? ''))) return
@@ -202,18 +231,21 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
     }
   }
   async function connect() {
-    if (!bridge || !token.trim() || !acceptedRisk) return
+    if (!bridge || (!useSavedCredential && !token.trim()) || !acceptedRisk) return
     const serial = ++requestSerial.current
     const credential = token.trim()
     setToken('')
     setBusy('connect'); setError(null); setCollectorProgress(null)
     try {
-      const data = await bridge.connect({ token: credential, acceptedRisk: true })
+      const data = await bridge.connect(useSavedCredential
+        ? { useSaved: true, acceptedRisk: true, riparlare_access_token: nativeAccessToken ?? undefined, riparlare_api_base_url: getApiBaseUrl() }
+        : { token: credential, acceptedRisk: true, ...(bridge.savedCredentialStatus ? { remember: rememberCredential && savedCredential?.available === true, riparlare_access_token: nativeAccessToken ?? undefined, riparlare_api_base_url: getApiBaseUrl() } : {}) })
       if (!mounted.current || serial !== requestSerial.current) return
       const source = normalizeInventory({ ...data, id: 'device-source', source_hash: '', status: 'source', authors: [] })
       setInventory(source); setSelection(emptySelection(source)); setFocusedId(source.channels[0]?.id ?? null)
       setDesktopSource(true); setDesktopScanned(false); setStep(1)
       setLinkResult(null)
+      if (rememberCredential && savedCredential?.available) setSavedCredential({ available: true, remembered: true, account: data.account })
       if (serverVerificationConsent && bridge.verifyAccount && data.account?.id) {
         const accessToken = useAuthStore.getState().token
         if (accessToken) {
@@ -226,7 +258,17 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
         } else setLinkResult({ discordId: data.account.id, status: 'failed' })
       }
     } catch (failure) {
-      if (mounted.current && serial === requestSerial.current) setError(collectorErrorMessage(failure, 'Discord bağlantısı kurulamadı. Erişimini ve kimlik bilgisini kontrol et. Kimlik bilgisini hata raporuna ekleme.'))
+      if (mounted.current && serial === requestSerial.current) {
+        setError(collectorErrorMessage(failure, 'Discord bağlantısı kurulamadı. Erişimini ve kimlik bilgisini kontrol et. Kimlik bilgisini hata raporuna ekleme.'))
+        // A saved reconnect can fail without losing the encrypted record (e.g.429).
+        // Allow manual reconnection while retaining the explicit forget action.
+        setUseSavedCredential(false)
+        if (bridge.savedCredentialStatus && nativeAccessToken) {
+          void bridge.savedCredentialStatus({ riparlare_access_token: nativeAccessToken, riparlare_api_base_url: getApiBaseUrl() }).then(status => {
+            if (mounted.current && serial === requestSerial.current) { setSavedCredential(status); setRememberCredential(status.available && status.remembered) }
+          }).catch(() => undefined)
+        }
+      }
     } finally { if (mounted.current && serial === requestSerial.current) setBusy(null) }
   }
   async function collect() {
@@ -457,8 +499,12 @@ export default function DiscordImportWizard({ onClose }: { onClose?: () => void 
             <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 text-sm leading-relaxed"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" /><p>Discord, kullanıcı hesabıyla otomatik veri okumayı yasaklıyor ve hesabına yaptırım uygulayabilir. Bu riski kabul etmek Discord kurallarını değiştirmez. Yalnızca kendi hesabınla erişebildiğin içeriği seç.</p></div>
             <label className="flex items-start gap-3 text-sm"><input type="checkbox" checked={acceptedRisk} onChange={event => setAcceptedRisk(event.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 accent-white" /><span>Kendi hesabımı kullanıyorum ve Discord hesabıma uygulanabilecek yaptırım riskini kabul ediyorum.</span></label>
             {bridge.verifyAccount && <label className="flex items-start gap-3 rounded-lg border p-4 text-sm leading-relaxed"><input type="checkbox" checked={serverVerificationConsent} onChange={event => setServerVerificationConsent(event.target.checked)} disabled={!!busy} className="mt-1 h-4 w-4 shrink-0 accent-white" /><span><span className="block font-medium">Discord hesabımı bağla (isteğe bağlı)</span><span className="mt-1 block text-xs text-muted-foreground">Hesap doğrulaması için tokenin Riparlare sunucusuna bir kez gönderilmesini kabul ediyorum. Sunucu Discord kimliğimi doğrular ve tokeni kaydetmez. Bu kutuyu seçmezsem aktarım cihazımda hazırlanır, tokenim Riparlare’ye gönderilmez.</span></span></label>}
-            <label className="block text-sm font-medium">Discord hesap tokeni<input type="password" autoComplete="off" autoCorrect="off" spellCheck={false} value={token} onChange={event => setToken(event.target.value)} disabled={!acceptedRisk || !!busy} className="mt-2 block w-full rounded-md border bg-popover px-3 py-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50" /></label><p className="text-xs leading-relaxed text-muted-foreground">Standart aktarımda token yalnızca cihazında kullanılır ve kaydedilmez. Yalnızca yukarıdaki ayrı hesap doğrulamasını seçersen sunucuya bir kez gönderilir. Tokeni sohbet veya hata raporunda paylaşma.</p>
-            <button type="button" disabled={!acceptedRisk || !token.trim() || !!busy} onClick={() => void connect()} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-50">{busy === 'connect' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}{busy === 'connect' ? 'Kaynaklar inceleniyor' : 'Bağlan ve kaynakları göster'}</button>
+            {savedCredential?.remembered && <div className="rounded-lg border p-4 text-sm"><p>Bu cihazda {savedCredential.account?.username ? `@${savedCredential.account.username}` : 'Discord hesabın'} hatırlanıyor.</p><div className="mt-3 flex flex-wrap gap-4"><button type="button" disabled={!!busy} onClick={() => { setUseSavedCredential(value => !value); setToken('') }} className="underline underline-offset-4">{useSavedCredential ? 'Farklı hesap kullan' : 'Hatırlanan hesabı kullan'}</button><button type="button" disabled={!!busy} onClick={() => void forgetCredential()} className="text-destructive underline underline-offset-4">Bu cihazdan unut</button></div></div>}
+            {!useSavedCredential && <label className="block text-sm font-medium">Discord hesap tokeni<input type="password" autoComplete="off" autoCorrect="off" spellCheck={false} value={token} onChange={event => setToken(event.target.value)} disabled={!acceptedRisk || !!busy} className="mt-2 block w-full rounded-md border bg-popover px-3 py-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50" /></label>}
+            {bridge.savedCredentialStatus && <label className="flex items-start gap-3 text-sm"><input type="checkbox" checked={rememberCredential} onChange={event => setRememberCredential(event.target.checked)} disabled={!savedCredential?.available || useSavedCredential || !!busy} className="mt-1 h-4 w-4 accent-white" /><span>Bu cihazda hatırla<span className="mt-1 block text-xs text-muted-foreground">Windows’un şifreli deposunda, yalnızca bu Riparlare hesabı için saklanır. Sunucuda veya tarayıcı deposunda tutulmaz. {useSavedCredential && 'Kaydı kaldırmak için “Bu cihazdan unut” seçeneğini kullan.'}</span></span></label>}
+            {bridge.savedCredentialStatus && savedCredential?.available === false && <p role="status" className="text-xs text-muted-foreground">Bu cihazda güvenli saklama kullanılamıyor. Hatırlama kapalı; tokeni yalnızca bu bağlantı için kullanabilirsin.</p>}
+            <p className="text-xs leading-relaxed text-muted-foreground">Token cihazında kullanılır; yalnızca “Bu cihazda hatırla” seçiliyse şifreli saklanır. Yukarıdaki ayrı hesap doğrulamasını seçersen sunucuya bir kez gönderilir. Tokeni sohbet veya hata raporunda paylaşma.</p>
+            <button type="button" disabled={!acceptedRisk || (!useSavedCredential && !token.trim()) || !!busy} onClick={() => void connect()} className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-50">{busy === 'connect' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}{busy === 'connect' ? 'Kaynaklar inceleniyor' : useSavedCredential ? 'Hatırlanan hesapla devam et' : 'Bağlan ve kaynakları göster'}</button>
           </>}
         </section>}
         {jobs.length > 0 && <section className="mt-9"><h3 className="mb-3 text-sm font-semibold">Önceki aktarımların</h3><div className="divide-y rounded-lg border">{jobs.slice(0, 15).map(job => <button key={job.id} type="button" disabled={!!busy} onClick={() => void resume(job.id)} className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-accent disabled:opacity-50"><FileArchive className="h-4 w-4 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 truncate">{job.guilds?.[0]?.name ?? `Discord aktarımı ${job.id.slice(0, 8)}`}</span><span className="text-xs text-muted-foreground">{doneStatus(job.status) ? 'Tamamlandı' : activeStatus(job.status) ? 'Devam ediyor' : job.status === 'failed' ? 'Tekrar incelenebilir' : 'Seçim bekliyor'}</span><ArrowRight className="h-4 w-4 text-muted-foreground" /></button>)}</div></section>}

@@ -261,6 +261,11 @@ export function selectionDateError(selection: ImportSelection): string | null {
 }
 
 const collectorErrors: Record<string, string> = {
+  SOURCE_CREDENTIAL_STORAGE_UNAVAILABLE: 'Bu cihazda güvenli şifreli saklama kullanılamıyor. Hatırlamayı kapatıp yalnızca bu bağlantı için devam et.',
+  SOURCE_SAVED_CREDENTIAL_UNAVAILABLE: 'Hatırlanan Discord bağlantısı artık kullanılamıyor. Farklı hesap kullan seçeneğiyle yeniden bağlan.',
+  SOURCE_CREDENTIAL_AUTH_REQUIRED: 'Hatırlanan bağlantıyı kullanmak için Riparlare hesabına yeniden giriş yap.',
+  SOURCE_CREDENTIAL_STORE_FAILED: 'Bağlantı bilgisi güvenli kaydedilemedi. Hatırlamayı kapatıp yeniden dene.',
+  SOURCE_AUTH_FAILED: 'Discord bağlantısının süresi dolmuş veya erişimi kaldırılmış. Hatırlanan kayıt temizlendi; yeniden bağlan.',
   SOURCE_CHANNEL_LIMIT: 'Tek aktarımda en fazla 3000 kanal seçebilirsin. Daha az sunucu veya kanal seç; mevcut seçimlerin korundu.',
   SOURCE_GUILD_LIMIT: 'Tek aktarımda en fazla 2000 sunucu seçebilirsin. Daha az sunucu seç.',
   SOURCE_MESSAGE_LIMIT: 'Bu seçim 100.000 mesaj sınırını aşıyor. Daha az kanal seçerek ayrı bir aktarım hazırla.',

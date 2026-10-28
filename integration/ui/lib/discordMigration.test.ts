@@ -98,6 +98,9 @@ describe('Discord import selection boundaries', () => {
   it('maps only safe collector codes inside IPC wrappers without displaying raw errors', () => {
     expect(collectorErrorMessage(new Error("Error invoking remote method 'scan': Error: SOURCE_CHANNEL_LIMIT"), 'fallback')).toContain('3000 kanal')
     expect(collectorErrorMessage(new Error('SOURCE_TIMEOUT'), 'fallback')).toContain('zaman aşımına')
+    expect(collectorErrorMessage(new Error('SOURCE_CREDENTIAL_STORAGE_UNAVAILABLE'), 'fallback')).toContain('güvenli şifreli saklama')
+    expect(collectorErrorMessage(new Error('SOURCE_SAVED_CREDENTIAL_UNAVAILABLE'), 'fallback')).toContain('yeniden bağlan')
+    expect(collectorErrorMessage(new Error('SOURCE_AUTH_FAILED'), 'fallback')).toContain('Hatırlanan kayıt temizlendi')
     for (const message of ['private-token=secret-value', 'SOURCE_NOT_ALLOWED private-secret', 'SOURCE_CHANNEL_LIMITsuffix']) {
       expect(collectorErrorMessage(new Error(message), 'Güvenli açıklama')).toBe('Güvenli açıklama')
     }
